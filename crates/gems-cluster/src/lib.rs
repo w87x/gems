@@ -37,6 +37,7 @@ pub mod gossip;
 mod log;
 mod primary;
 pub mod raft;
+pub mod raft_net;
 mod record;
 mod replica;
 mod server;

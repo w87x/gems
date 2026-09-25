@@ -574,6 +574,324 @@ impl RaftCore {
     }
 }
 
+/// Wire encoding for `Envelope`, used by `raft_net`'s real TCP shell.
+/// Kept in this module (rather than the network shell) since it's purely a
+/// function of these types, with the same "framed with a `u32` length
+/// prefix, decode returns `None` on a partial buffer" shape as
+/// `record::LogRecord` — the two are meant to compose the same way when a
+/// caller is accumulating bytes off a socket.
+pub mod wire {
+    use super::{Envelope, LogEntry, NodeId, Rpc, Term};
+    use crate::record::LogRecord;
+    use gems_common::{Error, Result};
+
+    const REQUEST_VOTE_REQUEST: u8 = 1;
+    const REQUEST_VOTE_RESPONSE: u8 = 2;
+    const APPEND_ENTRIES_REQUEST: u8 = 3;
+    const APPEND_ENTRIES_RESPONSE: u8 = 4;
+
+    pub fn encode(envelope: &Envelope) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&envelope.from.to_le_bytes());
+        payload.extend_from_slice(&envelope.to.to_le_bytes());
+        match &envelope.rpc {
+            Rpc::RequestVoteRequest {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                payload.push(REQUEST_VOTE_REQUEST);
+                payload.extend_from_slice(&term.to_le_bytes());
+                payload.extend_from_slice(&candidate_id.to_le_bytes());
+                payload.extend_from_slice(&last_log_index.to_le_bytes());
+                payload.extend_from_slice(&last_log_term.to_le_bytes());
+            }
+            Rpc::RequestVoteResponse {
+                term,
+                vote_granted,
+                voter_id,
+            } => {
+                payload.push(REQUEST_VOTE_RESPONSE);
+                payload.extend_from_slice(&term.to_le_bytes());
+                payload.push(*vote_granted as u8);
+                payload.extend_from_slice(&voter_id.to_le_bytes());
+            }
+            Rpc::AppendEntriesRequest {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => {
+                payload.push(APPEND_ENTRIES_REQUEST);
+                payload.extend_from_slice(&term.to_le_bytes());
+                payload.extend_from_slice(&leader_id.to_le_bytes());
+                payload.extend_from_slice(&prev_log_index.to_le_bytes());
+                payload.extend_from_slice(&prev_log_term.to_le_bytes());
+                payload.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                for entry in entries {
+                    payload.extend_from_slice(&entry.term.to_le_bytes());
+                    payload.extend_from_slice(&entry.command.encode());
+                }
+                payload.extend_from_slice(&leader_commit.to_le_bytes());
+            }
+            Rpc::AppendEntriesResponse {
+                term,
+                success,
+                match_index,
+                follower_id,
+            } => {
+                payload.push(APPEND_ENTRIES_RESPONSE);
+                payload.extend_from_slice(&term.to_le_bytes());
+                payload.push(*success as u8);
+                payload.extend_from_slice(&match_index.to_le_bytes());
+                payload.extend_from_slice(&follower_id.to_le_bytes());
+            }
+        }
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    /// Decode one envelope from the start of `buf`. `None` (not an error)
+    /// if `buf` doesn't yet hold a complete envelope.
+    pub fn decode(buf: &[u8]) -> Result<Option<(Envelope, usize)>> {
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let total_len = 4 + payload_len;
+        if buf.len() < total_len {
+            return Ok(None);
+        }
+        let payload = &buf[4..total_len];
+        let mut pos = 0;
+        let from = read_node_id(payload, &mut pos)?;
+        let to = read_node_id(payload, &mut pos)?;
+        let tag = read_u8(payload, &mut pos)?;
+
+        let rpc = match tag {
+            REQUEST_VOTE_REQUEST => Rpc::RequestVoteRequest {
+                term: read_term(payload, &mut pos)?,
+                candidate_id: read_node_id(payload, &mut pos)?,
+                last_log_index: read_u64(payload, &mut pos)?,
+                last_log_term: read_term(payload, &mut pos)?,
+            },
+            REQUEST_VOTE_RESPONSE => Rpc::RequestVoteResponse {
+                term: read_term(payload, &mut pos)?,
+                vote_granted: read_u8(payload, &mut pos)? != 0,
+                voter_id: read_node_id(payload, &mut pos)?,
+            },
+            APPEND_ENTRIES_REQUEST => {
+                let term = read_term(payload, &mut pos)?;
+                let leader_id = read_node_id(payload, &mut pos)?;
+                let prev_log_index = read_u64(payload, &mut pos)?;
+                let prev_log_term = read_term(payload, &mut pos)?;
+                let entry_count = read_u32(payload, &mut pos)? as usize;
+                let mut entries = Vec::with_capacity(entry_count);
+                for _ in 0..entry_count {
+                    let entry_term = read_term(payload, &mut pos)?;
+                    let (command, consumed) =
+                        LogRecord::decode(&payload[pos..])?.ok_or(Error::InvalidValue {
+                            detail: "truncated log entry inside AppendEntries payload",
+                        })?;
+                    pos += consumed;
+                    entries.push(LogEntry {
+                        term: entry_term,
+                        command,
+                    });
+                }
+                let leader_commit = read_u64(payload, &mut pos)?;
+                Rpc::AppendEntriesRequest {
+                    term,
+                    leader_id,
+                    prev_log_index,
+                    prev_log_term,
+                    entries,
+                    leader_commit,
+                }
+            }
+            APPEND_ENTRIES_RESPONSE => Rpc::AppendEntriesResponse {
+                term: read_term(payload, &mut pos)?,
+                success: read_u8(payload, &mut pos)? != 0,
+                match_index: read_u64(payload, &mut pos)?,
+                follower_id: read_node_id(payload, &mut pos)?,
+            },
+            _ => {
+                return Err(Error::InvalidValue {
+                    detail: "unknown Raft RPC tag",
+                })
+            }
+        };
+
+        Ok(Some((Envelope { from, to, rpc }, total_len)))
+    }
+
+    fn read_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
+        let b = *buf.get(*pos).ok_or(Error::InvalidValue {
+            detail: "Raft envelope truncated",
+        })?;
+        *pos += 1;
+        Ok(b)
+    }
+
+    fn read_node_id(buf: &[u8], pos: &mut usize) -> Result<NodeId> {
+        read_u32(buf, pos)
+    }
+
+    fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
+        if buf.len() < *pos + 4 {
+            return Err(Error::InvalidValue {
+                detail: "Raft envelope truncated",
+            });
+        }
+        let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        Ok(v)
+    }
+
+    fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
+        if buf.len() < *pos + 8 {
+            return Err(Error::InvalidValue {
+                detail: "Raft envelope truncated",
+            });
+        }
+        let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+        *pos += 8;
+        Ok(v)
+    }
+
+    fn read_term(buf: &[u8], pos: &mut usize) -> Result<Term> {
+        read_u64(buf, pos)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::record::LogRecord;
+        use gems_common::Tuid;
+
+        fn sample_entries() -> Vec<LogEntry> {
+            vec![
+                LogEntry {
+                    term: 1,
+                    command: LogRecord::Delete {
+                        id: Tuid::new([1u8; 16], 1),
+                    },
+                },
+                LogEntry {
+                    term: 2,
+                    command: LogRecord::Delete {
+                        id: Tuid::new([2u8; 16], 2),
+                    },
+                },
+            ]
+        }
+
+        #[test]
+        fn request_vote_request_roundtrip() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                rpc: Rpc::RequestVoteRequest {
+                    term: 5,
+                    candidate_id: 1,
+                    last_log_index: 10,
+                    last_log_term: 4,
+                },
+            };
+            let encoded = encode(&env);
+            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, env);
+        }
+
+        #[test]
+        fn append_entries_request_roundtrip_with_entries() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                rpc: Rpc::AppendEntriesRequest {
+                    term: 3,
+                    leader_id: 1,
+                    prev_log_index: 4,
+                    prev_log_term: 2,
+                    entries: sample_entries(),
+                    leader_commit: 3,
+                },
+            };
+            let encoded = encode(&env);
+            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, env);
+        }
+
+        #[test]
+        fn append_entries_response_roundtrip() {
+            let env = Envelope {
+                from: 2,
+                to: 1,
+                rpc: Rpc::AppendEntriesResponse {
+                    term: 3,
+                    success: true,
+                    match_index: 7,
+                    follower_id: 2,
+                },
+            };
+            let encoded = encode(&env);
+            let (decoded, _) = decode(&encoded).unwrap().unwrap();
+            assert_eq!(decoded, env);
+        }
+
+        #[test]
+        fn decode_returns_none_on_partial_buffer() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                rpc: Rpc::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                    voter_id: 1,
+                },
+            };
+            let encoded = encode(&env);
+            assert!(decode(&encoded[..encoded.len() - 1]).unwrap().is_none());
+        }
+
+        #[test]
+        fn decodes_two_back_to_back_envelopes() {
+            let a = Envelope {
+                from: 1,
+                to: 2,
+                rpc: Rpc::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                    voter_id: 1,
+                },
+            };
+            let b = Envelope {
+                from: 2,
+                to: 1,
+                rpc: Rpc::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: false,
+                    voter_id: 2,
+                },
+            };
+            let mut buf = encode(&a);
+            buf.extend_from_slice(&encode(&b));
+            let (decoded_a, consumed_a) = decode(&buf).unwrap().unwrap();
+            let (decoded_b, consumed_b) = decode(&buf[consumed_a..]).unwrap().unwrap();
+            assert_eq!(decoded_a, a);
+            assert_eq!(decoded_b, b);
+            assert_eq!(consumed_a + consumed_b, buf.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

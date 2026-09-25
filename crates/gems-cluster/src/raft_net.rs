@@ -1,0 +1,350 @@
+//! `RaftNode`: the real-network shell `raft.rs`'s module doc calls for —
+//! TCP sockets carrying `raft::wire`-encoded envelopes, a timer thread
+//! driving `tick()`, and committed entries applied to a real
+//! `gems_engine::Store`. One thread per accepted connection (consistent
+//! with `server.rs`'s style), plus one "engine" thread that exclusively
+//! owns the `RaftCore` and the `Store` — every other thread only ever
+//! reaches them by sending a message, so there's no locking to get wrong
+//! around the core algorithm itself.
+//!
+//! **Simplification versus a from-scratch production shell, worth naming
+//! rather than leaving implicit:** each outbound RPC opens a fresh,
+//! short-lived TCP connection rather than keeping persistent per-peer
+//! connections open. Simple and correct — small clusters at heartbeat-ish
+//! message rates don't need connection reuse — but it does mean a
+//! `connect()` (with a short timeout) is on the critical path of every
+//! tick, so a genuinely slow-to-refuse peer could delay a tick. Acceptable
+//! for proving the wiring out; worth revisiting under real deployment
+//! latency requirements.
+//!
+//! **Also simplified: election timeout jitter.** `RaftCore` deliberately
+//! doesn't randomize its own timeout (see its module doc); the "proper"
+//! shell behavior is to draw a fresh random timeout every time the
+//! election timer resets, which `RaftCore` doesn't expose a hook for. This
+//! shell instead draws *one* random timeout per node at startup (via
+//! `gems_common::rand`), which still staggers the first election across
+//! nodes — the scenario that actually needs randomness to avoid a
+//! guaranteed tie — but doesn't re-jitter afterward. A livelock from
+//! *that* gap specifically would need two nodes to keep re-timing-out in
+//! lockstep after the first election ever, which the fixed stagger from
+//! startup already makes very unlikely for a long-running node; full
+//! jitter-on-every-reset is real follow-on work, not implemented here.
+
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
+
+use gems_common::{Error, Result};
+use gems_engine::Store;
+
+use crate::raft::{wire, Envelope, NodeId, RaftCore, RaftError, Role, Term};
+use crate::record::LogRecord;
+
+enum EngineMsg {
+    Inbound(Envelope),
+    Propose(LogRecord, Sender<std::result::Result<u64, RaftError>>),
+    Status(Sender<(Role, Term)>),
+    Shutdown,
+}
+
+pub struct RaftNodeHandle {
+    to_engine: Sender<EngineMsg>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl RaftNodeHandle {
+    /// Append `command` to the log if this node is currently the leader.
+    /// Returns the log index it was assigned; the caller finds out it was
+    /// actually committed by polling `status`/watching the local `Store`,
+    /// same as any async-replicated write.
+    pub fn propose(&self, command: LogRecord) -> Result<u64> {
+        let (tx, rx) = mpsc::channel();
+        self.to_engine
+            .send(EngineMsg::Propose(command, tx))
+            .map_err(|_| Error::InvalidValue {
+                detail: "Raft engine thread is gone",
+            })?;
+        rx.recv()
+            .map_err(|_| Error::InvalidValue {
+                detail: "Raft engine thread dropped the propose response",
+            })?
+            .map_err(|_| Error::InvalidValue {
+                detail: "this node is not the Raft leader",
+            })
+    }
+
+    pub fn status(&self) -> Result<(Role, Term)> {
+        let (tx, rx) = mpsc::channel();
+        self.to_engine
+            .send(EngineMsg::Status(tx))
+            .map_err(|_| Error::InvalidValue {
+                detail: "Raft engine thread is gone",
+            })?;
+        rx.recv().map_err(|_| Error::InvalidValue {
+            detail: "Raft engine thread dropped the status response",
+        })
+    }
+
+    pub fn shutdown(mut self) {
+        let _ = self.to_engine.send(EngineMsg::Shutdown);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+/// Start a Raft node: opens `store_dir` as a `gems_engine::Store`, binds
+/// `listen_addr` for inbound RPCs, and spawns the accept loop plus the
+/// engine thread. `peers` maps every *other* node's id to its address.
+pub fn spawn(
+    id: NodeId,
+    listen_addr: &str,
+    peers: HashMap<NodeId, SocketAddr>,
+    store_dir: &std::path::Path,
+    tick_interval: Duration,
+    heartbeat_interval_ticks: u32,
+    election_timeout_ticks_range: (u32, u32),
+) -> Result<RaftNodeHandle> {
+    let store = Store::open(store_dir, true).or_else(|_| Store::create(store_dir))?;
+    let listener = TcpListener::bind(listen_addr)?;
+
+    let (to_engine, from_network) = mpsc::channel::<EngineMsg>();
+
+    // Accept loop: one thread per connection, each decoding envelopes off
+    // its socket and forwarding them into the engine's inbound channel.
+    let accept_sender = to_engine.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let sender = accept_sender.clone();
+            thread::spawn(move || {
+                let _ = handle_connection(stream, sender);
+            });
+        }
+    });
+
+    let (lo, hi) = election_timeout_ticks_range;
+    let span = hi.saturating_sub(lo).max(1);
+    let jittered = lo + (u32::from_le_bytes(gems_common::rand::random_bytes()) % span);
+
+    let peer_ids: Vec<NodeId> = peers.keys().copied().collect();
+    let core = RaftCore::new(id, peer_ids, jittered, heartbeat_interval_ticks);
+
+    let join = thread::spawn(move || {
+        run_engine(core, store, peers, from_network, tick_interval);
+    });
+
+    Ok(RaftNodeHandle {
+        to_engine,
+        join: Some(join),
+    })
+}
+
+fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()> {
+    let mut reader = stream;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Some((envelope, consumed)) = wire::decode(&buf)? {
+            let _ = sender.send(EngineMsg::Inbound(envelope));
+            buf.drain(..consumed);
+        }
+    }
+}
+
+fn send_envelope(addr: SocketAddr, envelope: &Envelope) {
+    // Best-effort: a send failure (peer down, network partition) is
+    // exactly the condition Raft is designed to tolerate — the tick loop
+    // will simply retry on the next heartbeat/election timeout. Logging
+    // it is a real deployment's job (this shell has no logging story
+    // yet); silently dropping is the correct *algorithmic* response.
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+        let _ = stream.write_all(&wire::encode(envelope));
+    }
+}
+
+fn apply_to_store(store: &mut Store, command: &LogRecord) {
+    let result = match command {
+        LogRecord::Insert { header, body } => store.insert(header.clone(), body),
+        LogRecord::Delete { id } => store.delete(id).map(|_| ()),
+    };
+    // A failure applying an already-committed, already-validated command
+    // indicates local corruption, not a Raft-level problem — nothing in
+    // this shell's scope to do about it beyond not crashing the engine
+    // loop over one bad apply.
+    let _ = result;
+}
+
+fn run_engine(
+    mut core: RaftCore,
+    mut store: Store,
+    peers: HashMap<NodeId, SocketAddr>,
+    inbound: Receiver<EngineMsg>,
+    tick_interval: Duration,
+) {
+    loop {
+        let outgoing = match inbound.recv_timeout(tick_interval) {
+            Ok(EngineMsg::Inbound(envelope)) => core.receive(envelope),
+            Ok(EngineMsg::Propose(command, respond)) => {
+                let result = core.propose(command);
+                let outgoing = match &result {
+                    Ok((_, msgs)) => msgs.clone(),
+                    Err(_) => Vec::new(),
+                };
+                let _ = respond.send(result.map(|(index, _)| index));
+                outgoing
+            }
+            Ok(EngineMsg::Status(respond)) => {
+                let _ = respond.send((core.role(), core.current_term()));
+                Vec::new()
+            }
+            Ok(EngineMsg::Shutdown) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) => core.tick(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+
+        for envelope in outgoing {
+            if let Some(&addr) = peers.get(&envelope.to) {
+                send_envelope(addr, &envelope);
+            }
+        }
+
+        for entry in core.take_newly_committed() {
+            apply_to_store(&mut store, &entry.command);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gems_catalog::{EntityFlags, EntityHeader, EntityKind};
+    use gems_common::Tuid;
+    use std::path::PathBuf;
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("gems-cluster-raft-net-test")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn header(id: Tuid) -> EntityHeader {
+        EntityHeader {
+            id,
+            created_by: [0u8; 16],
+            modified_by: [0u8; 16],
+            modified_at_ns: 0,
+            name: "w1".to_string(),
+            description: String::new(),
+            flags: EntityFlags::NONE,
+            entity_kind: EntityKind::Data,
+            schema_ref: Tuid::NIL,
+            body_offset: 0,
+            body_len: 0,
+        }
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn wait_for_leader(handles: &[(NodeId, RaftNodeHandle)], timeout: Duration) -> Option<NodeId> {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            for (id, handle) in handles {
+                if let Ok((Role::Leader, _)) = handle.status() {
+                    return Some(*id);
+                }
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    #[test]
+    fn three_real_nodes_elect_a_leader_and_replicate_a_proposal() {
+        let dir = tmp_dir("three_nodes");
+        let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+        let ids: Vec<NodeId> = vec![1, 2, 3];
+        let addrs: HashMap<NodeId, SocketAddr> = ids
+            .iter()
+            .zip(&ports)
+            .map(|(&id, &port)| (id, format!("127.0.0.1:{port}").parse().unwrap()))
+            .collect();
+
+        let mut handles = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let peers: HashMap<NodeId, SocketAddr> = addrs
+                .iter()
+                .filter(|(&pid, _)| pid != id)
+                .map(|(&pid, &addr)| (pid, addr))
+                .collect();
+            let handle = spawn(
+                id,
+                &format!("127.0.0.1:{}", ports[i]),
+                peers,
+                &dir.join(format!("node{id}")),
+                Duration::from_millis(20),
+                3,
+                (6, 10),
+            )
+            .unwrap();
+            handles.push((id, handle));
+        }
+
+        let leader_id = wait_for_leader(&handles, Duration::from_secs(5))
+            .expect("a leader must be elected within 5 seconds");
+        let leader = &handles.iter().find(|(id, _)| *id == leader_id).unwrap().1;
+
+        let entity_id = Tuid::new([7u8; 16], 7);
+        let index = leader
+            .propose(LogRecord::Insert {
+                header: header(entity_id),
+                body: b"hello".to_vec(),
+            })
+            .unwrap();
+        assert_eq!(index, 1);
+
+        // Give the cluster time to replicate and apply, then check every
+        // node's local Store — this is the real end-to-end assertion:
+        // actual TCP sockets, actual timer-driven ticks, actual
+        // gems_engine::Store writes on three separate node instances.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let all_applied = ids.iter().all(|&id| {
+                let store_dir = dir.join(format!("node{id}"));
+                gems_engine::Store::open(&store_dir, false)
+                    .ok()
+                    .and_then(|s| s.get(&entity_id).ok().flatten())
+                    .is_some()
+            });
+            if all_applied {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not every node applied the committed entry within 5 seconds"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        for (_, handle) in handles {
+            handle.shutdown();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
