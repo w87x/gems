@@ -54,6 +54,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-query"
+version = "0.1.0"
+
+[[package]]
 name = "gems-storage"
 version = "0.1.0"
 dependencies = [
