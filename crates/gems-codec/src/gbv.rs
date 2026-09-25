@@ -191,16 +191,32 @@ impl<'a> GbvReader<'a> {
             let e = self.entry_at(mid);
             match e.key_id.cmp(&key_id) {
                 std::cmp::Ordering::Equal => {
-                    let start = self.values_start + e.offset as usize;
-                    let end = start + e.len as usize;
                     let tag = TypeTag::from_u8(e.type_tag).ok()?;
-                    return Some((tag, &self.buf[start..end]));
+                    let bytes = self.field_bytes(&e)?;
+                    return Some((tag, bytes));
                 }
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Greater => hi = mid,
             }
         }
         None
+    }
+
+    /// Slices out a field's value bytes, checked against the buffer's
+    /// actual length. `offset`/`len` come straight from the on-disk/
+    /// on-wire directory — a corrupted buffer, or an entity body a
+    /// malicious Raft leader/replication primary crafted, can claim any
+    /// `u32` there. Without this check, `get`/`redact` would slice
+    /// `self.buf[start..end]` directly and panic (index out of bounds) the
+    /// instant a value's claimed range ran past the buffer, crashing
+    /// whatever process just read an ordinary entity.
+    fn field_bytes(&self, entry: &DirEntry) -> Option<&'a [u8]> {
+        let start = self.values_start.checked_add(entry.offset as usize)?;
+        let end = start.checked_add(entry.len as usize)?;
+        if end > self.buf.len() {
+            return None;
+        }
+        Some(&self.buf[start..end])
     }
 
     pub fn field_count(&self) -> usize {
@@ -223,10 +239,10 @@ impl<'a> GbvReader<'a> {
             if exclude.contains(&entry.key_id) {
                 continue;
             }
-            let start = self.values_start + entry.offset as usize;
-            let end = start + entry.len as usize;
-            if let Ok(tag) = TypeTag::from_u8(entry.type_tag) {
-                builder.push(entry.key_id, tag, &self.buf[start..end]);
+            if let (Ok(tag), Some(bytes)) =
+                (TypeTag::from_u8(entry.type_tag), self.field_bytes(&entry))
+            {
+                builder.push(entry.key_id, tag, bytes);
             }
         }
         builder.finish()
@@ -236,6 +252,28 @@ impl<'a> GbvReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn get_returns_none_instead_of_panicking_on_an_out_of_range_directory_entry() {
+        // Build one legitimate field, then corrupt its directory entry's
+        // offset/len to claim bytes far past the end of the buffer — the
+        // shape a corrupted on-disk value or a maliciously crafted
+        // replicated entity body could take. Before the fix this indexed
+        // `self.buf[start..end]` directly and panicked.
+        let mut b = GbvBuilder::new();
+        b.push(1, TypeTag::Str, b"hi");
+        let mut buf = b.finish();
+
+        // Directory entry layout: u32 key_id, u8 type_tag, u32 offset, u32 len.
+        let offset_pos = 2 + 4 + 1; // after field_count header + key_id + type_tag
+        buf[offset_pos..offset_pos + 4].copy_from_slice(&0u32.to_le_bytes());
+        buf[offset_pos + 4..offset_pos + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let r = GbvReader::new(&buf).unwrap();
+        assert_eq!(r.get(1), None);
+        // redact() must also not panic on the same corrupted entry.
+        assert!(GbvReader::new(&r.redact(&[])).is_ok());
+    }
 
     #[test]
     fn roundtrip_multiple_fields() {

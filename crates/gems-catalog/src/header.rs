@@ -104,11 +104,27 @@ impl EntityHeader {
 
         let name_len = buf[pos] as usize;
         pos += 1;
+        // `name_len` comes straight from an on-disk/on-wire byte, so a
+        // corrupted or maliciously crafted header (checksums only catch
+        // accidental corruption, not a peer that computes a matching
+        // checksum over fabricated bytes) could otherwise claim a length
+        // longer than the field's reserved space and pull bytes from the
+        // adjacent description field into the decoded name.
+        if name_len > NAME_MAX {
+            return Err(Error::CorruptPage {
+                detail: "entity header name length exceeds the maximum",
+            });
+        }
         let name = String::from_utf8_lossy(&buf[pos..pos + name_len]).into_owned();
         pos += NAME_MAX;
 
         let desc_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
         pos += 2;
+        if desc_len > DESCRIPTION_MAX {
+            return Err(Error::CorruptPage {
+                detail: "entity header description length exceeds the maximum",
+            });
+        }
         let description = String::from_utf8_lossy(&buf[pos..pos + desc_len]).into_owned();
         pos += DESCRIPTION_MAX;
 
@@ -201,5 +217,31 @@ mod tests {
         let encoded = h.encode();
         let decoded = EntityHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.name.len(), NAME_MAX);
+    }
+
+    #[test]
+    fn rejects_a_name_length_byte_claiming_more_than_the_reserved_field() {
+        // A crafted header (checksum recomputed to match, as a hostile
+        // peer able to construct arbitrary bytes would do) claiming a
+        // name_len bigger than NAME_MAX must be rejected rather than
+        // silently reading bytes from the adjacent description field.
+        let mut encoded = sample().encode();
+        let name_len_pos = 6 + TUID_LEN + 16 + 16 + 8; // matches decode()'s `pos` there
+        encoded[name_len_pos] = 200; // > NAME_MAX (63)
+        let checksum_at = ENCODED_LEN - 4;
+        let checksum = gems_common::crc32c::crc32c(&encoded[0..checksum_at]);
+        encoded[checksum_at..ENCODED_LEN].copy_from_slice(&checksum.to_le_bytes());
+        assert!(EntityHeader::decode(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_a_description_length_claiming_more_than_the_reserved_field() {
+        let mut encoded = sample().encode();
+        let desc_len_pos = 6 + TUID_LEN + 16 + 16 + 8 + 1 + NAME_MAX;
+        encoded[desc_len_pos..desc_len_pos + 2].copy_from_slice(&(60000u16).to_le_bytes()); // > DESCRIPTION_MAX (254)
+        let checksum_at = ENCODED_LEN - 4;
+        let checksum = gems_common::crc32c::crc32c(&encoded[0..checksum_at]);
+        encoded[checksum_at..ENCODED_LEN].copy_from_slice(&checksum.to_le_bytes());
+        assert!(EntityHeader::decode(&encoded).is_err());
     }
 }

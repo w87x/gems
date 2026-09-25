@@ -15,9 +15,21 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Object/array nesting depth this parser will follow before giving up.
+/// `parse_value` recurses through `parse_object`/`parse_array` once per
+/// level of nesting, so an unbounded input like `"[[[[[...".repeat(n)`
+/// would otherwise recurse until the call stack overflows — a stack
+/// overflow aborts the whole process unconditionally in Rust, unlike
+/// every other error case here which returns a normal `Result`. This
+/// matters most for `gems-mcp`, which parses JSON-RPC arguments directly
+/// from an MCP client over stdio. 64 levels is far deeper than any real
+/// entity/query payload this workspace produces needs.
+const MAX_NESTING_DEPTH: usize = 64;
+
 pub fn parse(src: &str) -> Result<Value, ParseError> {
     let mut parser = Parser {
         chars: src.chars().peekable(),
+        depth: 0,
     };
     parser.skip_whitespace();
     let value = parser.parse_value()?;
@@ -30,6 +42,7 @@ pub fn parse(src: &str) -> Result<Value, ParseError> {
 
 struct Parser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -76,50 +89,79 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Runs `f` one level deeper in object/array nesting, decrementing the
+    /// depth counter again afterward regardless of whether `f` succeeded —
+    /// takes `self` as a parameter to `f` rather than having `f` capture
+    /// it, so this method itself doesn't need to hold a borrow of `self`
+    /// across the call.
+    fn with_nesting<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, ParseError>,
+    ) -> Result<T, ParseError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            self.depth -= 1;
+            return Err(ParseError(format!(
+                "exceeds the maximum nesting depth of {MAX_NESTING_DEPTH}"
+            )));
+        }
+        let result = f(self);
+        self.depth -= 1;
+        result
+    }
+
     fn parse_object(&mut self) -> Result<Value, ParseError> {
-        self.expect('{')?;
-        let mut entries = Vec::new();
-        self.skip_whitespace();
-        if self.chars.peek() == Some(&'}') {
-            self.chars.next();
-            return Ok(Value::Object(entries));
-        }
-        loop {
-            self.skip_whitespace();
-            let key = self.parse_string()?;
-            self.skip_whitespace();
-            self.expect(':')?;
-            let value = self.parse_value()?;
-            entries.push((key, value));
-            self.skip_whitespace();
-            match self.chars.next() {
-                Some(',') => continue,
-                Some('}') => break,
-                other => return Err(ParseError(format!("expected ',' or '}}', found {other:?}"))),
+        self.with_nesting(|this| {
+            this.expect('{')?;
+            let mut entries = Vec::new();
+            this.skip_whitespace();
+            if this.chars.peek() == Some(&'}') {
+                this.chars.next();
+                return Ok(Value::Object(entries));
             }
-        }
-        Ok(Value::Object(entries))
+            loop {
+                this.skip_whitespace();
+                let key = this.parse_string()?;
+                this.skip_whitespace();
+                this.expect(':')?;
+                let value = this.parse_value()?;
+                entries.push((key, value));
+                this.skip_whitespace();
+                match this.chars.next() {
+                    Some(',') => continue,
+                    Some('}') => break,
+                    other => {
+                        return Err(ParseError(format!("expected ',' or '}}', found {other:?}")))
+                    }
+                }
+            }
+            Ok(Value::Object(entries))
+        })
     }
 
     fn parse_array(&mut self) -> Result<Value, ParseError> {
-        self.expect('[')?;
-        let mut items = Vec::new();
-        self.skip_whitespace();
-        if self.chars.peek() == Some(&']') {
-            self.chars.next();
-            return Ok(Value::Array(items));
-        }
-        loop {
-            let value = self.parse_value()?;
-            items.push(value);
-            self.skip_whitespace();
-            match self.chars.next() {
-                Some(',') => continue,
-                Some(']') => break,
-                other => return Err(ParseError(format!("expected ',' or ']', found {other:?}"))),
+        self.with_nesting(|this| {
+            this.expect('[')?;
+            let mut items = Vec::new();
+            this.skip_whitespace();
+            if this.chars.peek() == Some(&']') {
+                this.chars.next();
+                return Ok(Value::Array(items));
             }
-        }
-        Ok(Value::Array(items))
+            loop {
+                let value = this.parse_value()?;
+                items.push(value);
+                this.skip_whitespace();
+                match this.chars.next() {
+                    Some(',') => continue,
+                    Some(']') => break,
+                    other => {
+                        return Err(ParseError(format!("expected ',' or ']', found {other:?}")))
+                    }
+                }
+            }
+            Ok(Value::Array(items))
+        })
     }
 
     fn parse_string(&mut self) -> Result<String, ParseError> {
@@ -254,6 +296,18 @@ mod tests {
     fn rejects_trailing_comma() {
         assert!(parse(r#"{"a": 1,}"#).is_err());
         assert!(parse(r#"[1, 2,]"#).is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_nesting_instead_of_overflowing_the_stack() {
+        let nested = "[".repeat(MAX_NESTING_DEPTH + 1) + &"]".repeat(MAX_NESTING_DEPTH + 1);
+        assert!(parse(&nested).is_err());
+    }
+
+    #[test]
+    fn accepts_nesting_at_the_depth_limit() {
+        let nested = "[".repeat(MAX_NESTING_DEPTH) + &"]".repeat(MAX_NESTING_DEPTH);
+        assert!(parse(&nested).is_ok());
     }
 
     #[test]

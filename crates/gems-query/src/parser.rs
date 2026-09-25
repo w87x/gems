@@ -32,15 +32,29 @@ impl std::error::Error for ParseError {}
 
 pub fn parse(src: &str) -> Result<Query, ParseError> {
     let tokens = Lexer::new(src).tokenize().map_err(ParseError)?;
-    let mut parser = Parser { tokens, pos: 0 };
+    let mut parser = Parser {
+        tokens,
+        pos: 0,
+        expr_depth: 0,
+    };
     let query = parser.parse_query()?;
     parser.expect_eof()?;
     Ok(query)
 }
 
+/// Cap on `NOT`/parenthesis nesting in `parse_unary_expr`. A query string
+/// like `"NOT ".repeat(100_000) + "x = 1"` or an equivalent chain of
+/// parens would otherwise recurse until the call stack overflows — an
+/// unconditional process abort in Rust, unlike every other malformed-query
+/// case here, which returns an ordinary `ParseError`. Queries reach this
+/// parser from network-facing callers (gems-webui's `/api/query?q=`,
+/// gems-mcp's `query` tool), so an attacker fully controls the input.
+const MAX_EXPR_DEPTH: usize = 64;
+
 struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    expr_depth: usize,
 }
 
 impl Parser {
@@ -192,16 +206,31 @@ impl Parser {
     }
 
     fn parse_unary_expr(&mut self) -> Result<Expr, ParseError> {
-        if self.eat_keyword("NOT") {
-            return Ok(Expr::Not(Box::new(self.parse_unary_expr()?)));
+        let is_not = matches!(self.peek(), Token::Ident(s) if s.eq_ignore_ascii_case("NOT"));
+        let is_paren = *self.peek() == Token::LParen;
+        if !(is_not || is_paren) {
+            return self.parse_predicate();
         }
-        if *self.peek() == Token::LParen {
-            self.advance();
-            let inner = self.parse_or_expr()?;
-            self.expect(Token::RParen)?;
-            return Ok(inner);
+
+        self.expr_depth += 1;
+        if self.expr_depth > MAX_EXPR_DEPTH {
+            self.expr_depth -= 1;
+            return Err(ParseError(format!(
+                "expression nesting exceeds the maximum depth of {MAX_EXPR_DEPTH}"
+            )));
         }
-        self.parse_predicate()
+        let result = if is_not {
+            self.advance(); // consume 'NOT'
+            self.parse_unary_expr().map(|e| Expr::Not(Box::new(e)))
+        } else {
+            self.advance(); // consume '('
+            self.parse_or_expr().and_then(|inner| {
+                self.expect(Token::RParen)?;
+                Ok(inner)
+            })
+        };
+        self.expr_depth -= 1;
+        result
     }
 
     fn parse_predicate(&mut self) -> Result<Expr, ParseError> {
@@ -270,6 +299,32 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_excessive_not_nesting_instead_of_overflowing_the_stack() {
+        let src = format!(
+            "SELECT * FROM entities WHERE {}x = 1",
+            "NOT ".repeat(MAX_EXPR_DEPTH + 1)
+        );
+        assert!(parse(&src).is_err());
+    }
+
+    #[test]
+    fn rejects_excessive_paren_nesting_instead_of_overflowing_the_stack() {
+        let opens = "(".repeat(MAX_EXPR_DEPTH + 1);
+        let closes = ")".repeat(MAX_EXPR_DEPTH + 1);
+        let src = format!("SELECT * FROM entities WHERE {opens}x = 1{closes}");
+        assert!(parse(&src).is_err());
+    }
+
+    #[test]
+    fn accepts_not_and_paren_nesting_at_the_depth_limit() {
+        let src = format!(
+            "SELECT * FROM entities WHERE {}x = 1",
+            "NOT ".repeat(MAX_EXPR_DEPTH)
+        );
+        assert!(parse(&src).is_ok());
+    }
 
     #[test]
     fn parses_the_architecture_doc_example() {

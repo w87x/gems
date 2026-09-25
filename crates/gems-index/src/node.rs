@@ -61,7 +61,25 @@ impl<K: FixedCodec, V: FixedCodec> LeafView<K, V> {
                 detail: "expected leaf node",
             });
         }
+        if buf.len() < 3 {
+            return Err(Error::CorruptPage {
+                detail: "leaf node shorter than its header",
+            });
+        }
         let key_count = u16::from_le_bytes(buf[1..3].try_into().unwrap()) as usize;
+        // `key_count` is an on-disk byte an OS crash mid-write or disk
+        // corruption can leave inconsistent with the rest of the page (no
+        // per-page checksum exists to catch it earlier, unlike
+        // `EntityHeader`'s crc32c). Without this check, a corrupted count
+        // bigger than what the page could actually hold walks `pos` past
+        // `buf.len()` and panics on the first out-of-bounds slice — this
+        // check turns that into a normal `CorruptPage` error instead.
+        let max_entries = (buf.len() - LEAF_HEADER_LEN) / (K::LEN + V::LEN);
+        if key_count > max_entries {
+            return Err(Error::CorruptPage {
+                detail: "leaf node key_count exceeds what the page could hold",
+            });
+        }
         let mut entries = Vec::with_capacity(key_count);
         let mut pos = LEAF_HEADER_LEN;
         for _ in 0..key_count {
@@ -100,7 +118,24 @@ impl<K: FixedCodec> InternalView<K> {
                 detail: "expected internal node",
             });
         }
+        if buf.len() < 3 {
+            return Err(Error::CorruptPage {
+                detail: "internal node shorter than its header",
+            });
+        }
         let key_count = u16::from_le_bytes(buf[1..3].try_into().unwrap()) as usize;
+        // Same reasoning as `LeafView::decode`: validate the on-disk count
+        // against what the page could actually hold (n keys + (n+1)
+        // 4-byte children) before using it to walk `pos`, so a corrupted
+        // page returns `CorruptPage` instead of panicking on an
+        // out-of-bounds slice.
+        let budget = buf.len().saturating_sub(INTERNAL_HEADER_LEN + 4);
+        let max_keys = budget / (K::LEN + 4);
+        if key_count > max_keys {
+            return Err(Error::CorruptPage {
+                detail: "internal node key_count exceeds what the page could hold",
+            });
+        }
         let mut pos = INTERNAL_HEADER_LEN;
         let mut keys = Vec::with_capacity(key_count);
         for _ in 0..key_count {
@@ -139,4 +174,65 @@ pub fn node_type(buf: &[u8]) -> Result<u8> {
         });
     }
     Ok(buf[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gems_common::Tuid;
+    use gems_storage::SlotPointer;
+
+    const PAGE_SIZE: usize = 256;
+
+    fn slot(slot_index: u32) -> SlotPointer {
+        SlotPointer {
+            file_id: 1,
+            extent_index: 0,
+            slot_index,
+            block_class: 0,
+        }
+    }
+
+    #[test]
+    fn leaf_roundtrip() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let entries = vec![
+            (Tuid::new([1u8; 16], 1), slot(0)),
+            (Tuid::new([2u8; 16], 2), slot(1)),
+        ];
+        encode_leaf(&mut buf, &entries);
+        let decoded = LeafView::<Tuid, SlotPointer>::decode(&buf).unwrap();
+        assert_eq!(decoded.entries, entries);
+    }
+
+    #[test]
+    fn leaf_decode_rejects_a_key_count_bigger_than_the_page_could_hold() {
+        // Corrupt just the key_count field to claim far more entries than
+        // a page this size could ever store — the shape a torn write or
+        // bit-rot could produce. Before the fix this walked `pos` past
+        // `buf.len()` and panicked on the first out-of-bounds slice.
+        let mut buf = vec![0u8; PAGE_SIZE];
+        buf[0] = LEAF;
+        buf[1..3].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(LeafView::<Tuid, SlotPointer>::decode(&buf).is_err());
+    }
+
+    #[test]
+    fn internal_roundtrip() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        let keys = vec![Tuid::new([1u8; 16], 1), Tuid::new([2u8; 16], 2)];
+        let children = vec![10u32, 20, 30];
+        encode_internal(&mut buf, &keys, &children);
+        let decoded = InternalView::<Tuid>::decode(&buf).unwrap();
+        assert_eq!(decoded.keys, keys);
+        assert_eq!(decoded.children, children);
+    }
+
+    #[test]
+    fn internal_decode_rejects_a_key_count_bigger_than_the_page_could_hold() {
+        let mut buf = vec![0u8; PAGE_SIZE];
+        buf[0] = INTERNAL;
+        buf[1..3].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(InternalView::<Tuid>::decode(&buf).is_err());
+    }
 }
