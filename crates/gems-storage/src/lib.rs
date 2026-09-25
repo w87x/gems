@@ -7,7 +7,9 @@
 
 pub mod extent;
 pub mod file;
+pub mod manager;
 pub mod slot;
 
 pub use extent::{BlockClass, ExtentHeader, EXTENT_SIZE};
+pub use manager::ExtentManager;
 pub use slot::SlotPointer;

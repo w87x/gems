@@ -47,16 +47,16 @@ durable — the primary index and header pages need write-ahead framing (see
 
 ### 1.2 Extents and the 16 MiB / 4 KiB relationship
 
-A data file is a sequence of fixed-size **extents**, each exactly **16 MiB**.
-Every extent is dedicated to **one block-size class** — this is a segregated
-free-list allocator (a slab allocator, not a buddy allocator), not a
-variable-length heap:
+A data file is a sequence of fixed-size **extents**. Every extent is
+dedicated to **one block-size class** — this is a segregated free-list
+allocator (a slab allocator, not a buddy allocator), not a variable-length
+heap:
 
 ```
-extent (16 MiB)
-┌─────────────────────┬────────────────────────────────────────┐
-│ 4 KiB bitmap header  │  data slots, all the same size          │
-└─────────────────────┴────────────────────────────────────────┘
+extent
+┌────────────┬──────────────┬────────────────────────────────────────┐
+│ 16 B header │ 4 KiB bitmap │  16 MiB of data slots, all the same size │
+└────────────┴──────────────┴────────────────────────────────────────┘
 ```
 
 Block-size classes are powers of two from **512 B to 16 MiB**: 512, 1K, 2K,
@@ -66,14 +66,28 @@ extent", used for oversized entities that spill into their own extent chain).
 The elegant bit: a 4 KiB bitmap is **exactly** 32768 bits, and
 16 MiB / 512 B = 32768. So the smallest block class fills the bitmap
 perfectly; every larger class uses only the leading `16MiB/blocksize` bits
-of the same 4 KiB header and leaves the rest zeroed/unused. One bitmap
-format serves every class without variable-length headers.
+of the same 4 KiB bitmap and leaves the rest zeroed/unused. One bitmap
+format serves every class without variable-length headers. **This only
+holds if the header lives in its own space ahead of the bitmap** — an
+earlier draft of this design (and its first implementation) carved the
+16-byte header out of the same 4 KiB page as the bitmap, which quietly
+broke the fit on both sides at once: 16 bytes less bitmap capacity than
+the smallest class needs, computed against a data region that itself
+was wrongly assumed to be the full 16 MiB extent minus that same page.
+`gems-storage`'s test suite caught it (an out-of-bounds bitmap access
+once an extent actually filled up); the fix is the header/bitmap/data
+layout shown above — a 16-byte header, then a full untouched 4 KiB
+bitmap, then a genuine 16 MiB data region, making the extent's total
+on-disk footprint 16 MiB + 4 KiB + 16 B rather than an exact 16 MiB.
 
-Extent header (first 4 KiB of every extent):
+Extent header (16 bytes, immediately followed by the bitmap):
 - `magic: u32`, `format_version: u16`
 - `block_size_class: u8` (log2(block_size) - 9, so 0..=15 covers 512B..16MiB)
 - `slot_count: u32`, `free_count: u32` (cached, recomputed on scrub if in doubt)
-- `bitmap: [u8; 4096 - header_fields]` — 1 bit per slot, 1 = allocated
+
+Bitmap (4 KiB, immediately following the header): 1 bit per slot, 1 =
+allocated. Only the leading `slot_count` bits are meaningful for classes
+above the smallest; the rest stay zeroed.
 
 A data file's own header (offset 0, one OS page) records: file magic/version,
 extent size (fixed 16 MiB), page size the B-tree in this file was built with,
