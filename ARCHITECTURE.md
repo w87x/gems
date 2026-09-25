@@ -453,6 +453,30 @@ cleanly onto this design:
   pair of nodes) or disseminating the shard map specifically — the
   membership layer is there, what a shard map disseminated over it would
   look like is unbuilt.
+- **Both cores now have real network shells**: `raft_net`/`swim_net` bind
+  actual TCP sockets (`raft::wire`/`gossip::wire` handle the encode/decode,
+  same `u32`-length-prefixed framing as `record::LogRecord` throughout this
+  workspace) and run a timer-driven engine thread that exclusively owns
+  the core — everything else reaches it by message, so there's no locking
+  around the algorithm itself. `raft_net` also exposes a small client
+  protocol (`propose_remote`, a separate port and format from peer RPCs)
+  so a proposal can come from outside the cluster process entirely, not
+  just from code sharing memory with a node. Verified with real sockets,
+  real threads, real ports: three actual node processes elect a leader and
+  replicate a proposal into separate `gems_engine::Store` instances (Raft),
+  and three actual nodes converge on membership and detect an unreachable
+  one (SWIM) — both stable across repeated runs.
+- **Sharding is implemented at the "static config" scope named above**:
+  `gems-cluster::shard::ShardRouter` partitions TUIDs by their UUID
+  half's leading byte (uniform, no hashing needed, per this section's
+  design), `ShardMap` is the static shard -> node-address config, and
+  `ShardedClient` routes a proposal to the right shard's Raft group and
+  finds its current leader by trying each member's client port in turn.
+  No dynamic rebalancing, no gossip-disseminated shard map yet (still real
+  follow-on work) — but verified end to end with two actual independent
+  3-node Raft clusters: a client proposes one entity per shard, both
+  commit and apply on their respective cluster only, and each shard is
+  confirmed to have never received the other's entity.
 
 ## 7. Query language
 

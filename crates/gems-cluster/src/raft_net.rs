@@ -96,25 +96,44 @@ impl RaftNodeHandle {
     }
 }
 
+/// Tuning knobs bundled together mainly to keep `spawn`'s argument count
+/// sane; see `raft::RaftCore::new` for what `heartbeat_interval_ticks` and
+/// `election_timeout_ticks_range` mean (the latter is sampled once per
+/// node at startup — see this module's doc for why that's a fixed draw
+/// rather than continuous jitter).
+#[derive(Debug, Clone, Copy)]
+pub struct RaftTiming {
+    pub tick_interval: Duration,
+    pub heartbeat_interval_ticks: u32,
+    pub election_timeout_ticks_range: (u32, u32),
+}
+
 /// Start a Raft node: opens `store_dir` as a `gems_engine::Store`, binds
-/// `listen_addr` for inbound RPCs, and spawns the accept loop plus the
-/// engine thread. `peers` maps every *other* node's id to its address.
+/// `listen_addr` for inbound peer RPCs and `client_listen_addr` for
+/// inbound client propose requests (see `propose_remote`), and spawns
+/// both accept loops plus the engine thread. `peers` maps every *other*
+/// node's id to its (peer) address.
 pub fn spawn(
     id: NodeId,
     listen_addr: &str,
+    client_listen_addr: &str,
     peers: HashMap<NodeId, SocketAddr>,
     store_dir: &std::path::Path,
-    tick_interval: Duration,
-    heartbeat_interval_ticks: u32,
-    election_timeout_ticks_range: (u32, u32),
+    timing: RaftTiming,
 ) -> Result<RaftNodeHandle> {
+    let RaftTiming {
+        tick_interval,
+        heartbeat_interval_ticks,
+        election_timeout_ticks_range,
+    } = timing;
     let store = Store::open(store_dir, true).or_else(|_| Store::create(store_dir))?;
     let listener = TcpListener::bind(listen_addr)?;
+    let client_listener = TcpListener::bind(client_listen_addr)?;
 
     let (to_engine, from_network) = mpsc::channel::<EngineMsg>();
 
-    // Accept loop: one thread per connection, each decoding envelopes off
-    // its socket and forwarding them into the engine's inbound channel.
+    // Peer accept loop: one thread per connection, each decoding envelopes
+    // off its socket and forwarding them into the engine's inbound channel.
     let accept_sender = to_engine.clone();
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -122,6 +141,21 @@ pub fn spawn(
             let sender = accept_sender.clone();
             thread::spawn(move || {
                 let _ = handle_connection(stream, sender);
+            });
+        }
+    });
+
+    // Client accept loop: a separate port and a separate, much simpler
+    // protocol (see `propose_remote`) — a client isn't a Raft peer and
+    // shouldn't need to speak `raft::wire`'s Envelope format just to ask
+    // "please propose this command."
+    let client_sender = to_engine.clone();
+    thread::spawn(move || {
+        for stream in client_listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let sender = client_sender.clone();
+            thread::spawn(move || {
+                let _ = handle_client_connection(stream, sender);
             });
         }
     });
@@ -158,6 +192,70 @@ fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()>
             buf.drain(..consumed);
         }
     }
+}
+
+/// Client protocol: the client sends one `LogRecord::encode()`-framed
+/// request (that framing is already self-describing, so it composes with
+/// the same partial-read accumulation loop as everywhere else in this
+/// workspace) and reads back a fixed 9-byte response: `u8 status (0 =
+/// not leader, 1 = ok)` followed by `u64 index` (meaningful only when
+/// `status == 1`). One request per connection — simple, and proposals are
+/// rare enough relative to peer traffic that connection setup cost doesn't
+/// matter here either.
+const CLIENT_STATUS_NOT_LEADER: u8 = 0;
+const CLIENT_STATUS_OK: u8 = 1;
+
+fn handle_client_connection(mut stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let command = loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(()); // client disconnected before sending a full request
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some((record, _)) = LogRecord::decode(&buf)? {
+            break record;
+        }
+    };
+
+    let (tx, rx) = mpsc::channel();
+    if sender.send(EngineMsg::Propose(command, tx)).is_err() {
+        return Ok(());
+    }
+    let mut response = [0u8; 9];
+    match rx.recv() {
+        Ok(Ok(index)) => {
+            response[0] = CLIENT_STATUS_OK;
+            response[1..9].copy_from_slice(&index.to_le_bytes());
+        }
+        _ => response[0] = CLIENT_STATUS_NOT_LEADER,
+    }
+    stream.write_all(&response)?;
+    Ok(())
+}
+
+/// The other half of the client protocol above: connect to `addr` (a
+/// node's *client* port, not its peer port) and ask it to propose
+/// `command`. Returns the assigned log index on success, or an error if
+/// this node isn't the leader (or wasn't reachable at all) — a caller
+/// wanting to actually get a command committed retries against a
+/// different member of the same Raft group, since this function doesn't
+/// know who else is in it. See `shard.rs`'s `ShardedClient` for that retry
+/// loop.
+pub fn propose_remote(addr: SocketAddr, command: &LogRecord, timeout: Duration) -> Result<u64> {
+    let mut stream = TcpStream::connect_timeout(&addr, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.write_all(&command.encode())?;
+
+    let mut response = [0u8; 9];
+    stream.read_exact(&mut response)?;
+    if response[0] != CLIENT_STATUS_OK {
+        return Err(Error::InvalidValue {
+            detail: "target node is not the Raft leader",
+        });
+    }
+    Ok(u64::from_le_bytes(response[1..9].try_into().unwrap()))
 }
 
 fn send_envelope(addr: SocketAddr, envelope: &Envelope) {
@@ -279,6 +377,7 @@ mod tests {
     fn three_real_nodes_elect_a_leader_and_replicate_a_proposal() {
         let dir = tmp_dir("three_nodes");
         let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+        let client_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
         let ids: Vec<NodeId> = vec![1, 2, 3];
         let addrs: HashMap<NodeId, SocketAddr> = ids
             .iter()
@@ -296,11 +395,14 @@ mod tests {
             let handle = spawn(
                 id,
                 &format!("127.0.0.1:{}", ports[i]),
+                &format!("127.0.0.1:{}", client_ports[i]),
                 peers,
                 &dir.join(format!("node{id}")),
-                Duration::from_millis(20),
-                3,
-                (6, 10),
+                RaftTiming {
+                    tick_interval: Duration::from_millis(20),
+                    heartbeat_interval_ticks: 3,
+                    election_timeout_ticks_range: (6, 10),
+                },
             )
             .unwrap();
             handles.push((id, handle));
@@ -341,6 +443,80 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(50));
         }
+
+        for (_, handle) in handles {
+            handle.shutdown();
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn propose_remote_succeeds_against_the_leader_and_fails_against_a_follower() {
+        let dir = tmp_dir("propose_remote");
+        let ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+        let client_ports: Vec<u16> = (0..3).map(|_| free_port()).collect();
+        let ids: Vec<NodeId> = vec![1, 2, 3];
+        let addrs: HashMap<NodeId, SocketAddr> = ids
+            .iter()
+            .zip(&ports)
+            .map(|(&id, &port)| (id, format!("127.0.0.1:{port}").parse().unwrap()))
+            .collect();
+        let client_addrs: HashMap<NodeId, SocketAddr> = ids
+            .iter()
+            .zip(&client_ports)
+            .map(|(&id, &port)| (id, format!("127.0.0.1:{port}").parse().unwrap()))
+            .collect();
+
+        let mut handles = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let peers: HashMap<NodeId, SocketAddr> = addrs
+                .iter()
+                .filter(|(&pid, _)| pid != id)
+                .map(|(&pid, &addr)| (pid, addr))
+                .collect();
+            let handle = spawn(
+                id,
+                &format!("127.0.0.1:{}", ports[i]),
+                &format!("127.0.0.1:{}", client_ports[i]),
+                peers,
+                &dir.join(format!("node{id}")),
+                RaftTiming {
+                    tick_interval: Duration::from_millis(20),
+                    heartbeat_interval_ticks: 3,
+                    election_timeout_ticks_range: (6, 10),
+                },
+            )
+            .unwrap();
+            handles.push((id, handle));
+        }
+
+        let leader_id = wait_for_leader(&handles, Duration::from_secs(5))
+            .expect("a leader must be elected within 5 seconds");
+        let follower_id = ids.iter().copied().find(|&id| id != leader_id).unwrap();
+
+        // A remote client, over the network, talking only to the client
+        // port — no in-process channel, no shared memory with the node.
+        let entity_id = Tuid::new([9u8; 16], 9);
+        let index = propose_remote(
+            client_addrs[&leader_id],
+            &LogRecord::Insert {
+                header: header(entity_id),
+                body: b"via-network".to_vec(),
+            },
+            Duration::from_secs(2),
+        )
+        .expect("proposing to the actual leader's client port must succeed");
+        assert_eq!(index, 1);
+
+        let follower_result = propose_remote(
+            client_addrs[&follower_id],
+            &LogRecord::Delete { id: entity_id },
+            Duration::from_secs(2),
+        );
+        assert!(
+            follower_result.is_err(),
+            "proposing to a follower's client port must fail, not silently redirect"
+        );
 
         for (_, handle) in handles {
             handle.shutdown();
