@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gems-common",
+    "crates/gems-storage",
+    "crates/gems-codec",
+    "crates/gems-catalog",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+rustix = { version = "1", features = ["fs", "mm", "param"] }
