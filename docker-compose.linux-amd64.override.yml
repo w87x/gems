@@ -23,3 +23,5 @@ services:
     platform: linux/amd64
   client:
     platform: linux/amd64
+  webui:
+    platform: linux/amd64
