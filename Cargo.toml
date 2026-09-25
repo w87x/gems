@@ -12,6 +12,7 @@ members = [
     "crates/gems-abac",
     "crates/gems-cli",
     "crates/gems-cluster",
+    "crates/gems-subscribe",
 ]
 
 [workspace.package]

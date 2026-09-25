@@ -505,6 +505,49 @@ materialization.
   when the policy entity itself changes (it's a normal entity, so this is
   just "invalidate on write to a Policy-kind entity").
 
+## 8a. Change notifications: subscriptions and materialized views
+
+A natural feature given §6's replication log already exists — added on
+request, not originally scoped, so noted as its own section rather than
+folded silently into §6. **Implemented in `gems-subscribe`.** The key
+insight: a subscriber is architecturally just a replica that doesn't write
+to a `Store` — it evaluates a predicate against each `LogRecord` instead of
+applying it, so this crate reuses `gems-cluster`'s `LogRecord`/
+`ReplicationLog` rather than inventing a parallel change-capture mechanism.
+
+Two tiers, deliberately kept separate because their cost is genuinely
+different:
+
+- **Point-level** (`"entity Z deleted"`, `"entity X's attribute Y
+  changed"`): cheap. A delete is just `LogRecord::Delete`. An attribute
+  change needs a "before" to diff against, which a single `Insert` record
+  doesn't carry (it's the new state, not a diff) — solved with a small
+  cache of last-observed values, but only for `(entity, attribute)` pairs
+  someone actually subscribed to, not a full shadow copy of every entity.
+  First sighting of a watched attribute seeds the cache without firing (no
+  prior value to have changed from).
+- **Aggregate** (`"count(entities matching P) changed"`): genuinely
+  harder — real incremental view maintenance, not event filtering. A
+  `LogRecord` says an entity was written or deleted, not whether that
+  pushed it in or out of some predicate's matching set, so a view has to
+  evaluate the predicate itself and track the full matching-id set (not
+  just a counter) to correctly detect a membership transition. `COUNT`
+  only and a single-condition predicate (entity kind, type, or one
+  attribute equality) for this pass — compiling a richer predicate from
+  `gems-query`'s `Expr` tree, or other aggregates (`SUM`/`MIN`/`MAX`), is
+  real follow-on integration work, not a small addition.
+
+Both tiers are pure, I/O-free state machines (`SubscriptionEngine`,
+`ViewEngine`), same design pattern as §6's `RaftCore`/`SwimCore` and for
+the same reason — deterministic tests instead of ones depending on real
+time. `NotificationHub` combines them so a `ViewChanged` watch fires
+correctly off a view's count transition. `LogTailer` is the thin shell
+that actually reads a `ReplicationLog` file and drives a hub; it's
+local/same-machine for this pass (a remote subscriber would need a small
+client analogous to `ReplicaClient` but feeding a `NotificationHub`
+instead of a `Store` — not needed yet since pointing `LogTailer` at a
+replica's already-synced local copy of the log works today).
+
 ## 9. Frontends
 
 All four talk to the same query/ABAC engine as a library — no frontend
