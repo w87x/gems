@@ -23,7 +23,7 @@ pub const DESCRIPTION_MAX: usize = 254;
 pub const ENCODED_LEN: usize =
     4 + 2 + 24 + 16 + 16 + 8 + 1 + NAME_MAX + 2 + DESCRIPTION_MAX + 4 + 1 + 24 + 4 + 4 + 4;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct EntityHeader {
     pub id: Tuid,
     pub created_by: [u8; 16],

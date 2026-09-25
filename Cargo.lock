@@ -52,6 +52,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-cluster"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-common",
+ "gems-engine",
+]
+
+[[package]]
 name = "gems-codec"
 version = "0.1.0"
 dependencies = [

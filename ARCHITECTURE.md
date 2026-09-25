@@ -412,6 +412,21 @@ cleanly onto this design:
   warm standby cheaply), (3) full Raft once the apply-record format has
   proven stable under (2). Don't build the hard distributed-systems part
   against a storage format that's still moving.
+- **Stage (2) is implemented**, in `gems-cluster`: `PrimaryStore` wraps
+  `gems-engine::Store` and appends a `LogRecord` (Insert/Delete, at the
+  logical-operation level rather than a physical page diff — the CoW
+  B-tree/extent internals stay private to `gems-engine`) to a
+  `ReplicationLog` after every mutation; `ReplicationServer` streams that
+  log to any number of connecting `ReplicaClient`s over a plain blocking
+  TCP socket (one thread per connection, a short poll loop to notice newly
+  appended records — no OS-specific file-watching needed); each replica
+  applies records to its own local `Store` and persists its progress so a
+  restart resumes rather than replays. Verified with real sockets: a
+  replica catches up on pre-existing writes, keeps tailing writes made
+  while it's connected, and converges with the primary across both inserts
+  and a delete. What it deliberately does not have — consensus, leader
+  election, split-brain protection, automatic failover — is stage (3)'s
+  job, not a gap in stage (2).
 
 ## 7. Query language
 
