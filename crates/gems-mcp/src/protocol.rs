@@ -2,6 +2,7 @@
 //! framing, and the MCP-specific `initialize`/`tools/list`/`tools/call`
 //! methods. Tool execution itself lives in `tools.rs`.
 
+use gems_abac::token::AuthMode;
 use gems_json::Value;
 
 use crate::tools;
@@ -12,8 +13,9 @@ const INVALID_PARAMS: i64 = -32602;
 
 /// Handle one JSON-RPC request line, returning the response line to write
 /// (or `None` for a notification, which per JSON-RPC has no `id` and
-/// expects no response).
-pub fn dispatch(line: &str) -> Option<String> {
+/// expects no response). `auth` is the server's authentication posture —
+/// see `tools.rs`'s module doc.
+pub fn dispatch(line: &str, auth: &AuthMode) -> Option<String> {
     let request = match gems_json::parse(line) {
         Ok(v) => v,
         Err(e) => {
@@ -35,7 +37,7 @@ pub fn dispatch(line: &str) -> Option<String> {
         "initialize" => success_response(id, initialize_result()),
         "tools/list" => success_response(id, tools_list_result()),
         "tools/call" => match request.get("params") {
-            Some(params) => success_response(id, handle_tools_call(params)),
+            Some(params) => success_response(id, handle_tools_call(params, auth)),
             None => error_response(id, INVALID_PARAMS, "tools/call requires params"),
         },
         other => error_response(id, METHOD_NOT_FOUND, &format!("unknown method: {other}")),
@@ -101,27 +103,29 @@ fn string_prop(description: &str) -> Value {
 }
 
 fn tools_list_result() -> Value {
+    let auth_token_prop = || {
+        string_prop(
+            "Bearer-style access token from gems-abac::token::issue. Required unless the \
+             server is running in --insecure mode.",
+        )
+    };
+
     let mut query_props = Value::object();
     query_props.set("store_dir", string_prop("Path to the store directory"));
     query_props.set(
         "query",
         string_prop("A SELECT ... FROM entities ... query string"),
     );
-    query_props.set(
-        "subject",
-        string_prop("Optional: acting subject's hex id, for ABAC-enforced results"),
-    );
+    query_props.set("auth_token", auth_token_prop());
 
     let mut get_entity_props = Value::object();
     get_entity_props.set("store_dir", string_prop("Path to the store directory"));
     get_entity_props.set("id", string_prop("Entity id, as 48 hex characters"));
-    get_entity_props.set(
-        "subject",
-        string_prop("Optional: acting subject's hex id, for ABAC-enforced results"),
-    );
+    get_entity_props.set("auth_token", auth_token_prop());
 
     let mut list_types_props = Value::object();
     list_types_props.set("store_dir", string_prop("Path to the store directory"));
+    list_types_props.set("auth_token", auth_token_prop());
 
     let tools = vec![
         tool_schema(
@@ -149,15 +153,15 @@ fn tools_list_result() -> Value {
     result
 }
 
-fn handle_tools_call(params: &Value) -> Value {
+fn handle_tools_call(params: &Value, auth: &AuthMode) -> Value {
     let name = params.get("name").and_then(Value::as_str);
     let empty_args = Value::object();
     let args = params.get("arguments").unwrap_or(&empty_args);
 
     let tool_result = match name {
-        Some("query") => tools::query(args),
-        Some("get_entity") => tools::get_entity(args),
-        Some("list_entity_types") => tools::list_entity_types(args),
+        Some("query") => tools::query(args, auth),
+        Some("get_entity") => tools::get_entity(args, auth),
+        Some("list_entity_types") => tools::list_entity_types(args, auth),
         Some(other) => Err(format!("unknown tool: {other}")),
         None => Err("tools/call requires a tool name".to_string()),
     };
@@ -184,17 +188,25 @@ fn handle_tools_call(params: &Value) -> Value {
 mod tests {
     use super::*;
 
+    fn insecure() -> AuthMode {
+        AuthMode::Insecure
+    }
+
     #[test]
     fn notification_without_id_gets_no_response() {
         assert_eq!(
-            dispatch(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            dispatch(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+                &insecure()
+            ),
             None
         );
     }
 
     #[test]
     fn unknown_method_is_a_json_rpc_error() {
-        let response = dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"bogus"}"#).unwrap();
+        let response =
+            dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"bogus"}"#, &insecure()).unwrap();
         let parsed = gems_json::parse(&response).unwrap();
         assert_eq!(parsed.get("id"), Some(&Value::Number(1.0)));
         assert!(parsed.get("error").is_some());
@@ -206,7 +218,11 @@ mod tests {
 
     #[test]
     fn initialize_returns_server_info() {
-        let response = dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#).unwrap();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+            &insecure(),
+        )
+        .unwrap();
         let parsed = gems_json::parse(&response).unwrap();
         let result = parsed.get("result").unwrap();
         assert_eq!(
@@ -222,7 +238,11 @@ mod tests {
 
     #[test]
     fn tools_list_returns_three_tools() {
-        let response = dispatch(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#).unwrap();
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            &insecure(),
+        )
+        .unwrap();
         let parsed = gems_json::parse(&response).unwrap();
         let tools = parsed.get("result").unwrap().get("tools").unwrap();
         assert_eq!(tools.as_array().unwrap().len(), 3);
@@ -232,6 +252,7 @@ mod tests {
     fn tools_call_with_unknown_tool_is_a_content_level_error_not_a_protocol_error() {
         let response = dispatch(
             r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
+            &insecure(),
         )
         .unwrap();
         let parsed = gems_json::parse(&response).unwrap();
@@ -244,8 +265,23 @@ mod tests {
     }
 
     #[test]
+    fn tools_call_without_a_token_under_enforced_auth_is_a_content_level_error() {
+        let auth = AuthMode::Enforced {
+            secret: b"secret".to_vec(),
+        };
+        let response = dispatch(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_entity_types","arguments":{"store_dir":"/tmp/nonexistent"}}}"#,
+            &auth,
+        )
+        .unwrap();
+        let parsed = gems_json::parse(&response).unwrap();
+        let result = parsed.get("result").unwrap();
+        assert_eq!(result.get("isError"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
     fn malformed_json_is_a_parse_error() {
-        let response = dispatch("{not json").unwrap();
+        let response = dispatch("{not json", &insecure()).unwrap();
         let parsed = gems_json::parse(&response).unwrap();
         assert_eq!(
             parsed.get("error").unwrap().get("code"),

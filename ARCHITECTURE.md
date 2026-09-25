@@ -466,6 +466,22 @@ cleanly onto this design:
   replicate a proposal into separate `gems_engine::Store` instances (Raft),
   and three actual nodes converge on membership and detect an unreachable
   one (SWIM) — both stable across repeated runs.
+- **Peer traffic is authenticated**: every `raft::wire`/`gossip::wire`
+  frame carries an HMAC-SHA256 tag over its payload, keyed by a secret
+  shared across the cluster (`raft_net::spawn`/`swim_net::spawn` both take
+  it as an `Arc<Vec<u8>>`). Without this, any TCP client that could reach
+  a node's peer port could inject Raft/SWIM messages directly —
+  forge votes, propose bogus committed entries, or manipulate another
+  node's membership view — without being a configured cluster member at
+  all. A shared secret is a deliberately simple scheme relative to real
+  mTLS/PKI (this workspace's "avoid third-party crates" rule extends to
+  crypto — `gems-common::sha256`/`hmac` are hand-rolled, verified against
+  NIST/RFC test vectors), reasonable for an operator-trusted cluster where
+  every node already reads the same secret from its own deployment config.
+  **Not yet covered**: the separate client-facing propose port
+  (`propose_remote`) an external caller uses to submit a proposal without
+  being a peer at all — that's a distinct authNz surface (a caller, not a
+  cluster member) and is real follow-on work, not silently assumed safe.
 - **Sharding is implemented at the "static config" scope named above**:
   `gems-cluster::shard::ShardRouter` partitions TUIDs by their UUID
   half's leading byte (uniform, no hashing needed, per this section's
@@ -528,6 +544,26 @@ materialization.
   representation as user queries) and cache it; re-evaluate the cache only
   when the policy entity itself changes (it's a normal entity, so this is
   just "invalidate on write to a Policy-kind entity").
+- **Authentication (establishing *who* the `SubjectContext` is) is
+  separate from the PDP/PEP above (deciding what that subject may see),
+  and lives in `gems-abac::token`**: JWT-shaped (RFC 7519), HS256
+  (HMAC-SHA256) signed and verified with a shared secret, built on this
+  workspace's own hand-rolled `sha256`/`hmac`/`base64url` primitives
+  (`gems-common`) rather than a crypto or JWT crate — deliberately minimal
+  relative to the full JWT spec (one fixed header, one algorithm, three
+  claims: `sub`, `roles`, optional `exp`; no algorithm negotiation, which
+  closes off the classic JWT "alg confusion" attack by construction, since
+  `verify` never branches on what the token itself claims). `gems-webui`
+  and `gems-mcp` both require a valid, unexpired token by default
+  (`AuthMode::Enforced`) and use the `SubjectContext` it verifies to for
+  every read — replacing an earlier scheme where a caller could just pass
+  a `subject`/`roles` parameter directly with nothing verifying they
+  actually *were* that subject (i.e. anyone could read as anyone by
+  editing a query parameter). `AuthMode::Insecure` (an explicit
+  `--insecure` startup flag) restores raw, unauthenticated access, for
+  local testing only — never the default, and a server refuses to start
+  under `Enforced` without its secret configured (fail closed, not a
+  silently-empty default secret every deployment would share).
 
 ## 8a. Change notifications: subscriptions and materialized views
 
@@ -606,17 +642,21 @@ gets a shortcut around policy enforcement.
   Served by a small hand-rolled blocking HTTP/1.1 server over `rustix`
   sockets — admin-tool traffic levels don't need an async runtime. API
   surface for this pass is read-only: `/api/types`, `/api/query`,
-  `/api/entity`, all `GET`, JSON responses (hand-rolled encoder/decoder),
-  ABAC opt-in via a `subject` query parameter. Entity CRUD/policy admin
-  through the WebUI is a later pass (needs the same schema-driven form
-  generation the TUI's create/edit scope cut defers).
+  `/api/entity`, all `GET`, JSON responses (hand-rolled encoder/decoder).
+  Authentication is required by default (§8's `gems-abac::token`): every
+  request needs a valid `Authorization: Bearer <token>` header, or the
+  server refuses to start; `--insecure` opts back into raw access, for
+  local testing only. Entity CRUD/policy admin through the WebUI is a
+  later pass (needs the same schema-driven form generation the TUI's
+  create/edit scope cut defers).
 - **MCP** (`gems-mcp`, built): JSON-RPC 2.0 over stdio (newline-delimited,
   no `Content-Length` framing), exposing `query`, `get_entity`,
   `list_entity_types` — thin adapter over the same engine, subject to the
-  same ABAC PEP (an MCP client is just another authenticated subject, via
-  optional `subject`/`roles` tool arguments). Dispatch logic is split from
-  the stdio loop (`protocol.rs`/`tools.rs` vs. a thin `main.rs`) for the
-  same testability reason as the TUI's `app.rs` split.
+  same ABAC PEP. Authentication mirrors the WebUI's: an `auth_token`
+  tool argument verified against `$GEMS_MCP_SECRET` by default, with the
+  same `--insecure` escape hatch. Dispatch logic is split from the stdio
+  loop (`protocol.rs`/`tools.rs` vs. a thin `main.rs`) for the same
+  testability reason as the TUI's `app.rs` split.
 
 ## 10. Crate layout
 

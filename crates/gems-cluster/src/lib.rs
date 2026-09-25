@@ -209,6 +209,7 @@ mod integration_tests {
                         heartbeat_interval_ticks: 3,
                         election_timeout_ticks_range: (6, 10),
                     },
+                    std::sync::Arc::new(b"test-cluster-secret".to_vec()),
                 )
                 .unwrap();
                 handles.push(handle);

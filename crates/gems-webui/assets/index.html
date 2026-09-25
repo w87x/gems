@@ -86,8 +86,9 @@
     <label for="store_dir">Store directory</label>
     <input id="store_dir" placeholder="/path/to/store">
 
-    <label for="subject">Acting subject (hex, optional — enables ABAC enforcement)</label>
-    <input id="subject" placeholder="leave empty for raw/administrative access">
+    <label for="token">Access token</label>
+    <input id="token" placeholder="Bearer token from gems-abac::token::issue" type="password">
+    <div class="status">Sent as an Authorization: Bearer header. The subject/roles it verifies to are what ABAC enforces reads against — the server no longer trusts a plain subject id typed here.</div>
 
     <label for="query">Query</label>
     <textarea id="query">SELECT * FROM entities</textarea>
@@ -114,14 +115,16 @@
 const $ = (id) => document.getElementById(id);
 
 function storeDir() { return $('store_dir').value.trim(); }
-function subject() { return $('subject').value.trim(); }
+function token() { return $('token').value.trim(); }
 
 async function api(path, params) {
   const url = new URL(path, window.location.origin);
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
   }
-  const res = await fetch(url);
+  const headers = {};
+  if (token()) headers['Authorization'] = 'Bearer ' + token();
+  const res = await fetch(url, { headers });
   return res.json();
 }
 
@@ -144,7 +147,7 @@ function escapeHtml(s) {
 
 async function runQuery() {
   $('query-error').textContent = '';
-  const result = await api('/api/query', { store_dir: storeDir(), q: $('query').value, subject: subject() });
+  const result = await api('/api/query', { store_dir: storeDir(), q: $('query').value });
   if (!result.ok) {
     $('query-error').textContent = result.error;
     $('results').hidden = true;
@@ -165,7 +168,7 @@ async function listTypes() {
 }
 
 async function loadDetail(id) {
-  const result = await api('/api/entity', { store_dir: storeDir(), id, subject: subject() });
+  const result = await api('/api/entity', { store_dir: storeDir(), id });
   const detail = $('detail');
   $('detail-placeholder').hidden = true;
   detail.hidden = false;

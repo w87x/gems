@@ -17,11 +17,11 @@
 //! long-lived, cached handle — simple and correct, at the cost of paying
 //! `Store::open`'s cost on every tool call. Fine for how infrequently an
 //! MCP client actually calls a tool; worth revisiting if that stops being
-//! true. ABAC enforcement is opt-in per call (a `subject`/`roles`
-//! argument switches to the `_enforced` `Store` methods), same design as
-//! `gems-cli`'s `--as` flag and for the same reason — an MCP client acting
-//! as a specific subject should say so, but nothing here forces every
-//! call through a subject context.
+//! true.
+//!
+//! **Authentication is required by default** — see `tools.rs`'s module
+//! doc. Every tool call must carry a valid `auth_token` argument, unless
+//! the server was started with `--insecure` (see `main.rs`).
 
 mod protocol;
 mod tools;

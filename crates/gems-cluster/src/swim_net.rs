@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -61,7 +62,9 @@ impl SwimNodeHandle {
 
 /// Start a SWIM node: binds `listen_addr` for inbound ping/ack traffic and
 /// spawns the accept loop plus the engine thread. `peers` maps every
-/// *other* node's id to its address.
+/// *other* node's id to its address. `secret` authenticates peer traffic
+/// (see `gossip::wire::encode`'s doc) and must be the same across every
+/// node in the cluster.
 pub fn spawn(
     id: NodeId,
     listen_addr: &str,
@@ -69,17 +72,20 @@ pub fn spawn(
     protocol_period: Duration,
     ping_timeout_ticks: u32,
     suspicion_timeout_ticks: u32,
+    secret: Arc<Vec<u8>>,
 ) -> Result<SwimNodeHandle> {
     let listener = TcpListener::bind(listen_addr)?;
     let (to_engine, from_network) = mpsc::channel::<EngineMsg>();
 
     let accept_sender = to_engine.clone();
+    let accept_secret = Arc::clone(&secret);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let sender = accept_sender.clone();
+            let secret = Arc::clone(&accept_secret);
             thread::spawn(move || {
-                let _ = handle_connection(stream, sender);
+                let _ = handle_connection(stream, sender, &secret);
             });
         }
     });
@@ -91,7 +97,7 @@ pub fn spawn(
     let core = SwimCore::new(id, peer_ids, 1, ping_timeout_ticks, suspicion_timeout_ticks);
 
     let join = thread::spawn(move || {
-        run_engine(core, peers, from_network, protocol_period);
+        run_engine(core, peers, from_network, protocol_period, secret);
     });
 
     Ok(SwimNodeHandle {
@@ -100,7 +106,7 @@ pub fn spawn(
     })
 }
 
-fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()> {
+fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>, secret: &[u8]) -> Result<()> {
     let mut reader = stream;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -110,20 +116,20 @@ fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()>
             return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
-        while let Some((envelope, consumed)) = wire::decode(&buf)? {
+        while let Some((envelope, consumed)) = wire::decode(&buf, secret)? {
             let _ = sender.send(EngineMsg::Inbound(envelope));
             buf.drain(..consumed);
         }
     }
 }
 
-fn send_envelope(addr: SocketAddr, envelope: &Envelope) {
+fn send_envelope(addr: SocketAddr, envelope: &Envelope, secret: &[u8]) {
     // Best-effort, same reasoning as raft_net::send_envelope: a failed
     // send here is exactly the "ping didn't get through" signal SWIM's
     // failure detector is built to notice on its own, via the timeout
     // that already fires when no Ack arrives.
     if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-        let _ = stream.write_all(&wire::encode(envelope));
+        let _ = stream.write_all(&wire::encode(envelope, secret));
     }
 }
 
@@ -132,6 +138,7 @@ fn run_engine(
     peers: HashMap<NodeId, SocketAddr>,
     inbound: Receiver<EngineMsg>,
     protocol_period: Duration,
+    secret: Arc<Vec<u8>>,
 ) {
     loop {
         let outgoing = match inbound.recv_timeout(protocol_period) {
@@ -147,7 +154,7 @@ fn run_engine(
 
         for envelope in outgoing {
             if let Some(&addr) = peers.get(&envelope.to) {
-                send_envelope(addr, &envelope);
+                send_envelope(addr, &envelope, &secret);
             }
         }
     }
@@ -156,6 +163,10 @@ fn run_engine(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_secret() -> Arc<Vec<u8>> {
+        Arc::new(b"test-cluster-secret".to_vec())
+    }
 
     fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
@@ -200,6 +211,7 @@ mod tests {
                 Duration::from_millis(20),
                 3,
                 10,
+                test_secret(),
             )
             .unwrap();
             handles.push((id, handle));
@@ -254,6 +266,7 @@ mod tests {
                 Duration::from_millis(20),
                 3,
                 10,
+                test_secret(),
             )
             .unwrap();
             handles.push((id, handle));

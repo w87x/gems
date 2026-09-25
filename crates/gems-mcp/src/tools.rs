@@ -1,10 +1,23 @@
 //! The three MCP tools: `query`, `get_entity`, `list_entity_types`. Each
-//! takes the JSON-RPC call's `arguments` object and returns a `gems_json::
-//! Value` result or a plain-string error — `protocol.rs` is what wraps
-//! either into the MCP `content`/`isError` shape.
+//! takes the JSON-RPC call's `arguments` object plus the server's
+//! `AuthMode` and returns a `gems_json::Value` result or a plain-string
+//! error — `protocol.rs` is what wraps either into the MCP
+//! `content`/`isError` shape.
+//!
+//! **Authentication**: by default (`AuthMode::Enforced`), every call must
+//! carry a valid `auth_token` argument (a token `gems-abac::token::issue`
+//! produced), and every read goes through `Store::*_enforced` using the
+//! `SubjectContext` that token verifies to. This replaced an earlier
+//! scheme where a call could just pass `subject`/`roles` arguments
+//! directly — nothing verified the caller actually *was* that subject, so
+//! any MCP client could read as anyone by naming a different subject id.
+//! `AuthMode::Insecure` restores raw, unauthenticated access — an
+//! explicit opt-in, never the default.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use gems_abac::token::AuthMode;
 use gems_abac::SubjectContext;
 use gems_catalog::{EntityHeader, EntityKind};
 use gems_common::Tuid;
@@ -21,22 +34,17 @@ fn open_store(args: &Value) -> Result<Store, String> {
     Store::open(Path::new(dir), false).map_err(|e| e.to_string())
 }
 
-fn subject_context(args: &Value) -> Option<SubjectContext> {
-    let subject_id = args
-        .get("subject")
-        .and_then(Value::as_str)
-        .and_then(Tuid::from_hex_str)?;
-    let roles = args
-        .get("roles")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|v| v.as_str().and_then(Tuid::from_hex_str))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(SubjectContext { subject_id, roles })
+/// Authorizes a tool call under `auth`, using the call's `auth_token`
+/// argument (if any) as the bearer token. `Ok(None)` only ever happens in
+/// `Insecure` mode — under `Enforced`, a missing/invalid/expired token is
+/// always an `Err`, never a silent fall-through to raw access.
+fn authorize(args: &Value, auth: &AuthMode) -> Result<Option<SubjectContext>, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let token = args.get("auth_token").and_then(Value::as_str);
+    auth.authorize(token, now).map_err(|e| e.to_string())
 }
 
 fn entity_summary(header: &EntityHeader) -> Value {
@@ -49,7 +57,8 @@ fn entity_summary(header: &EntityHeader) -> Value {
     v
 }
 
-pub fn query(args: &Value) -> ToolResult {
+pub fn query(args: &Value, auth: &AuthMode) -> ToolResult {
+    let subject = authorize(args, auth)?;
     let store = open_store(args)?;
     let query_str = args
         .get("query")
@@ -58,7 +67,7 @@ pub fn query(args: &Value) -> ToolResult {
     let query = gems_query::parse(query_str).map_err(|e| e.to_string())?;
 
     let mut results = Value::array();
-    match subject_context(args) {
+    match subject {
         Some(subject) => {
             for (header, _) in store
                 .query_enforced(&query, &subject)
@@ -78,7 +87,8 @@ pub fn query(args: &Value) -> ToolResult {
     Ok(results)
 }
 
-pub fn get_entity(args: &Value) -> ToolResult {
+pub fn get_entity(args: &Value, auth: &AuthMode) -> ToolResult {
+    let subject = authorize(args, auth)?;
     let store = open_store(args)?;
     let id_hex = args
         .get("id")
@@ -86,7 +96,7 @@ pub fn get_entity(args: &Value) -> ToolResult {
         .ok_or("id is required")?;
     let id = Tuid::from_hex_str(id_hex).ok_or("invalid id: must be 48 hex characters")?;
 
-    let found = match subject_context(args) {
+    let found = match subject {
         Some(subject) => store
             .get_enforced(&id, &subject)
             .map_err(|e| e.to_string())?,
@@ -114,7 +124,8 @@ pub fn get_entity(args: &Value) -> ToolResult {
     Ok(result)
 }
 
-pub fn list_entity_types(args: &Value) -> ToolResult {
+pub fn list_entity_types(args: &Value, auth: &AuthMode) -> ToolResult {
+    authorize(args, auth)?;
     let store = open_store(args)?;
     let mut results = Value::array();
     for id in store
@@ -201,7 +212,7 @@ mod tests {
         let dir = tmp_dir("list_types");
         seed_store(&dir);
         let args = args_with(&[("store_dir", dir.to_str().unwrap())]);
-        let result = list_entity_types(&args).unwrap();
+        let result = list_entity_types(&args, &AuthMode::Insecure).unwrap();
         let types = result.as_array().unwrap();
         assert_eq!(types.len(), 1);
         assert_eq!(types[0].get("name").unwrap().as_str(), Some("widget"));
@@ -216,7 +227,7 @@ mod tests {
             ("store_dir", dir.to_str().unwrap()),
             ("id", &entity_id.to_hex_string()),
         ]);
-        let result = get_entity(&args).unwrap();
+        let result = get_entity(&args, &AuthMode::Insecure).unwrap();
         assert_eq!(result.get("name").unwrap().as_str(), Some("w1"));
         assert_eq!(
             result.get("fields").unwrap().get("1").unwrap().as_str(),
@@ -230,7 +241,7 @@ mod tests {
         let dir = tmp_dir("get_entity_bad_id");
         seed_store(&dir);
         let args = args_with(&[("store_dir", dir.to_str().unwrap()), ("id", "not-hex")]);
-        assert!(get_entity(&args).is_err());
+        assert!(get_entity(&args, &AuthMode::Insecure).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -241,7 +252,7 @@ mod tests {
         let mut args = Value::object();
         args.set("store_dir", dir.to_str().unwrap());
         args.set("query", "SELECT * FROM entities WHERE type IN (widget)");
-        let result = query(&args).unwrap();
+        let result = query(&args, &AuthMode::Insecure).unwrap();
         let matches = result.as_array().unwrap();
         assert_eq!(matches.len(), 1);
         assert_eq!(
@@ -254,19 +265,60 @@ mod tests {
     #[test]
     fn query_with_missing_store_dir_is_an_error() {
         let args = Value::object();
-        assert!(query(&args).is_err());
+        assert!(query(&args, &AuthMode::Insecure).is_err());
     }
 
     #[test]
-    fn enforced_query_sees_nothing_without_a_permit_policy() {
-        let dir = tmp_dir("query_enforced");
+    fn enforced_mode_without_a_token_is_an_error() {
+        let dir = tmp_dir("query_no_token");
         seed_store(&dir);
         let mut args = Value::object();
         args.set("store_dir", dir.to_str().unwrap());
         args.set("query", "SELECT * FROM entities WHERE type IN (widget)");
-        args.set("subject", Tuid::NIL.to_hex_string());
-        let result = query(&args).unwrap();
+        let auth = AuthMode::Enforced {
+            secret: b"secret".to_vec(),
+        };
+        assert!(query(&args, &auth).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enforced_query_with_a_valid_token_sees_nothing_without_a_permit_policy() {
+        let dir = tmp_dir("query_enforced");
+        seed_store(&dir);
+        let secret = b"secret".to_vec();
+        let subject = SubjectContext {
+            subject_id: Tuid::generate(),
+            roles: vec![],
+        };
+        let token = gems_abac::token::issue(&secret, &subject, None);
+        let mut args = Value::object();
+        args.set("store_dir", dir.to_str().unwrap());
+        args.set("query", "SELECT * FROM entities WHERE type IN (widget)");
+        args.set("auth_token", token);
+        let auth = AuthMode::Enforced { secret };
+        let result = query(&args, &auth).unwrap();
         assert!(result.as_array().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_token_signed_with_a_different_secret_is_rejected() {
+        let dir = tmp_dir("query_wrong_secret");
+        seed_store(&dir);
+        let subject = SubjectContext {
+            subject_id: Tuid::generate(),
+            roles: vec![],
+        };
+        let token = gems_abac::token::issue(b"attacker-secret", &subject, None);
+        let mut args = Value::object();
+        args.set("store_dir", dir.to_str().unwrap());
+        args.set("query", "SELECT * FROM entities WHERE type IN (widget)");
+        args.set("auth_token", token);
+        let auth = AuthMode::Enforced {
+            secret: b"real-secret".to_vec(),
+        };
+        assert!(query(&args, &auth).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

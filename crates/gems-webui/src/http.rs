@@ -26,6 +26,7 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
 }
 
 impl Request {
@@ -34,6 +35,21 @@ impl Request {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Case-insensitive header lookup, per HTTP's own field-name matching
+    /// rules (`Authorization` and `authorization` are the same header).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The bearer token from an `Authorization: Bearer <token>` header, if
+    /// present and correctly formed.
+    pub fn bearer_token(&self) -> Option<&str> {
+        self.header("Authorization")?.strip_prefix("Bearer ")
     }
 }
 
@@ -65,14 +81,18 @@ pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
     let method = parts.next().ok_or("missing method")?.to_string();
     let target = parts.next().ok_or("missing request target")?.to_string();
 
-    // Drain (and ignore) headers up to the blank line — no header this
-    // crate's routes need to read. Bounded in both line length and line
-    // count so a client can't hold the connection open indefinitely by
-    // never sending the terminating blank line.
+    // Read headers up to the blank line, bounded in both line length and
+    // line count so a client can't hold the connection open indefinitely
+    // by never sending the terminating blank line.
+    let mut headers = Vec::new();
     for _ in 0..MAX_HEADER_LINES {
         let header_line = read_line_capped(&mut reader)?;
-        if header_line.is_empty() || header_line.trim().is_empty() {
+        let trimmed = header_line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
             break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
         }
     }
 
@@ -86,6 +106,7 @@ pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
         method,
         path,
         query,
+        headers,
     })
 }
 

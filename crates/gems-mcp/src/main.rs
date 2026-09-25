@@ -4,8 +4,16 @@
 //! All protocol/tool logic lives in the library (`gems_mcp::dispatch`) —
 //! this is deliberately as thin as `gems-cli`'s `main` is over its own
 //! command functions.
+//!
+//! **Authentication is required by default** (see `tools.rs`'s module
+//! doc): refuses to start unless `$GEMS_MCP_SECRET` is set (the HMAC
+//! secret used to verify each call's `auth_token` argument), or `--insecure`
+//! is passed on the command line — which restores raw, unauthenticated
+//! access and prints a loud warning, for local testing only.
 
 use std::io::{self, BufRead, Read, Write};
+
+use gems_abac::token::AuthMode;
 
 /// `BufRead::read_line`/`lines()` has no length limit: a client that never
 /// sends a newline makes it buffer unboundedly. stdio is normally a
@@ -14,8 +22,32 @@ use std::io::{self, BufRead, Read, Write};
 /// frontends (gems-webui, gems-cluster) cap their own length-prefixed and
 /// line-based reads.
 const MAX_LINE_LEN: u64 = 16 * 1024 * 1024;
+const SECRET_ENV_VAR: &str = "GEMS_MCP_SECRET";
 
 fn main() {
+    let insecure = std::env::args().any(|a| a == "--insecure");
+    let auth = if insecure {
+        eprintln!(
+            "gems-mcp: running with --insecure — every tool call gets raw, unauthenticated, \
+             unenforced access. Do not use this outside local testing."
+        );
+        AuthMode::Insecure
+    } else {
+        match std::env::var(SECRET_ENV_VAR) {
+            Ok(secret) if !secret.is_empty() => AuthMode::Enforced {
+                secret: secret.into_bytes(),
+            },
+            _ => {
+                eprintln!(
+                    "gems-mcp: refusing to start without ${SECRET_ENV_VAR} set (the HMAC \
+                     secret used to verify each call's auth_token argument). Set it, or pass \
+                     --insecure to explicitly run without authentication (local testing only)."
+                );
+                std::process::exit(1);
+            }
+        }
+    };
+
     let stdin = io::stdin();
     let mut reader = stdin.lock();
     let mut stdout = io::stdout();
@@ -45,7 +77,7 @@ fn main() {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = gems_mcp::dispatch(&line) {
+        if let Some(response) = gems_mcp::dispatch(&line, &auth) {
             let _ = writeln!(stdout, "{response}");
             let _ = stdout.flush();
         }

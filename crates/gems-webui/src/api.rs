@@ -1,16 +1,22 @@
 //! JSON API routes: `/api/types`, `/api/query`, `/api/entity`. All `GET`
 //! with query-string parameters — see `main.rs`'s module doc for why this
-//! pass is read-only (writes go through the CLI or MCP for now). Mirrors
-//! `gems-mcp`'s tool logic closely (same underlying `gems_engine::Store`
-//! calls, same ABAC-opt-in-via-a-parameter pattern) since both are thin
-//! frontends over the same engine — kept as separate, small
-//! implementations rather than factored into a shared crate, since each
-//! is only a few dozen lines and the two frontends' request shapes
-//! (query-string vs JSON-RPC arguments) differ enough that a shared
-//! abstraction would mostly be indirection.
+//! pass is read-only (writes go through the CLI or MCP for now).
+//!
+//! **Authentication**: by default (`AuthMode::Enforced`), every request
+//! must carry a valid, unexpired `Authorization: Bearer <token>` header —
+//! a token `gems-abac::token::issue` produced — and every read goes
+//! through `Store::*_enforced` using the `SubjectContext` that token
+//! verifies to. This replaced an earlier scheme where a request could
+//! just pass `?subject=<hex>` directly: nothing verified that the caller
+//! actually *was* that subject, so anyone could read as anyone by editing
+//! a query parameter. `AuthMode::Insecure` (the `--insecure` startup flag)
+//! restores unauthenticated, unenforced raw access — an explicit opt-in
+//! for trusted-network/local-testing use, never the default.
 
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use gems_abac::token::AuthMode;
 use gems_abac::SubjectContext;
 use gems_catalog::{EntityHeader, EntityKind};
 use gems_common::Tuid;
@@ -28,13 +34,17 @@ fn open_store(req: &Request) -> Result<Store, (u16, String)> {
     Store::open(Path::new(dir), false).map_err(|e| (400, e.to_string()))
 }
 
-fn subject_context(req: &Request) -> Option<SubjectContext> {
-    let subject_id = req.query_param("subject").and_then(Tuid::from_hex_str)?;
-    let roles = req
-        .query_param("roles")
-        .map(|s| s.split(',').filter_map(Tuid::from_hex_str).collect())
-        .unwrap_or_default();
-    Some(SubjectContext { subject_id, roles })
+/// Authenticates `req` under `auth`, returning the `SubjectContext` to
+/// enforce reads under. `Ok(None)` only ever happens in `Insecure` mode —
+/// under `Enforced`, a missing/invalid/expired token is always an `Err`
+/// (401), never a silent fall-through to raw access.
+fn authorize(req: &Request, auth: &AuthMode) -> Result<Option<SubjectContext>, (u16, String)> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    auth.authorize(req.bearer_token(), now)
+        .map_err(|e| (401, e.to_string()))
 }
 
 fn entity_summary(header: &EntityHeader) -> Value {
@@ -47,7 +57,8 @@ fn entity_summary(header: &EntityHeader) -> Value {
     v
 }
 
-pub fn list_types(req: &Request) -> ApiResult {
+pub fn list_types(req: &Request, auth: &AuthMode) -> ApiResult {
+    authorize(req, auth)?;
     let store = open_store(req)?;
     let mut results = Value::array();
     for id in store
@@ -61,7 +72,8 @@ pub fn list_types(req: &Request) -> ApiResult {
     Ok(results)
 }
 
-pub fn query(req: &Request) -> ApiResult {
+pub fn query(req: &Request, auth: &AuthMode) -> ApiResult {
+    let subject = authorize(req, auth)?;
     let store = open_store(req)?;
     let query_str = req
         .query_param("q")
@@ -69,7 +81,7 @@ pub fn query(req: &Request) -> ApiResult {
     let parsed = gems_query::parse(query_str).map_err(|e| (400, e.to_string()))?;
 
     let mut results = Value::array();
-    match subject_context(req) {
+    match subject {
         Some(subject) => {
             for (header, _) in store
                 .query_enforced(&parsed, &subject)
@@ -89,14 +101,15 @@ pub fn query(req: &Request) -> ApiResult {
     Ok(results)
 }
 
-pub fn get_entity(req: &Request) -> ApiResult {
+pub fn get_entity(req: &Request, auth: &AuthMode) -> ApiResult {
+    let subject = authorize(req, auth)?;
     let store = open_store(req)?;
     let id_hex = req
         .query_param("id")
         .ok_or((400, "id is required".to_string()))?;
     let id = Tuid::from_hex_str(id_hex).ok_or((400, "invalid id".to_string()))?;
 
-    let found = match subject_context(req) {
+    let found = match subject {
         Some(subject) => store
             .get_enforced(&id, &subject)
             .map_err(|e| (500, e.to_string()))?,
@@ -203,6 +216,10 @@ mod tests {
     }
 
     fn req(pairs: &[(&str, &str)]) -> Request {
+        req_with_headers(pairs, &[])
+    }
+
+    fn req_with_headers(pairs: &[(&str, &str)], headers: &[(&str, &str)]) -> Request {
         Request {
             method: "GET".to_string(),
             path: "/api/test".to_string(),
@@ -210,14 +227,26 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         }
+    }
+
+    fn bearer_req(pairs: &[(&str, &str)], token: &str) -> Request {
+        req_with_headers(pairs, &[("Authorization", &format!("Bearer {token}"))])
     }
 
     #[test]
     fn list_types_returns_the_seeded_type() {
         let dir = tmp_dir("list_types");
         seed(&dir);
-        let result = list_types(&req(&[("store_dir", dir.to_str().unwrap())])).unwrap();
+        let result = list_types(
+            &req(&[("store_dir", dir.to_str().unwrap())]),
+            &AuthMode::Insecure,
+        )
+        .unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -226,10 +255,13 @@ mod tests {
     fn query_finds_the_seeded_entity() {
         let dir = tmp_dir("query");
         let (_, entity_id) = seed(&dir);
-        let result = query(&req(&[
-            ("store_dir", dir.to_str().unwrap()),
-            ("q", "SELECT * FROM entities WHERE type IN (widget)"),
-        ]))
+        let result = query(
+            &req(&[
+                ("store_dir", dir.to_str().unwrap()),
+                ("q", "SELECT * FROM entities WHERE type IN (widget)"),
+            ]),
+            &AuthMode::Insecure,
+        )
         .unwrap();
         let matches = result.as_array().unwrap();
         assert_eq!(matches.len(), 1);
@@ -244,10 +276,13 @@ mod tests {
     fn get_entity_includes_fields() {
         let dir = tmp_dir("get_entity");
         let (_, entity_id) = seed(&dir);
-        let result = get_entity(&req(&[
-            ("store_dir", dir.to_str().unwrap()),
-            ("id", &entity_id.to_hex_string()),
-        ]))
+        let result = get_entity(
+            &req(&[
+                ("store_dir", dir.to_str().unwrap()),
+                ("id", &entity_id.to_hex_string()),
+            ]),
+            &AuthMode::Insecure,
+        )
         .unwrap();
         assert_eq!(
             result.get("fields").unwrap().get("1").unwrap().as_str(),
@@ -258,7 +293,7 @@ mod tests {
 
     #[test]
     fn missing_store_dir_is_a_400() {
-        let err = list_types(&req(&[])).unwrap_err();
+        let err = list_types(&req(&[]), &AuthMode::Insecure).unwrap_err();
         assert_eq!(err.0, 400);
     }
 
@@ -266,12 +301,71 @@ mod tests {
     fn missing_entity_is_a_404() {
         let dir = tmp_dir("missing_entity");
         seed(&dir);
-        let err = get_entity(&req(&[
-            ("store_dir", dir.to_str().unwrap()),
-            ("id", &Tuid::generate().to_hex_string()),
-        ]))
+        let err = get_entity(
+            &req(&[
+                ("store_dir", dir.to_str().unwrap()),
+                ("id", &Tuid::generate().to_hex_string()),
+            ]),
+            &AuthMode::Insecure,
+        )
         .unwrap_err();
         assert_eq!(err.0, 404);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enforced_mode_without_a_token_is_a_401() {
+        let dir = tmp_dir("enforced_no_token");
+        seed(&dir);
+        let auth = AuthMode::Enforced {
+            secret: b"test-secret".to_vec(),
+        };
+        let err = list_types(&req(&[("store_dir", dir.to_str().unwrap())]), &auth).unwrap_err();
+        assert_eq!(err.0, 401);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enforced_mode_rejects_a_token_signed_with_a_different_secret() {
+        let dir = tmp_dir("enforced_wrong_secret");
+        seed(&dir);
+        let subject = SubjectContext {
+            subject_id: Tuid::generate(),
+            roles: vec![],
+        };
+        let token = gems_abac::token::issue(b"attacker-secret", &subject, None);
+        let auth = AuthMode::Enforced {
+            secret: b"real-secret".to_vec(),
+        };
+        let req = bearer_req(&[("store_dir", dir.to_str().unwrap())], &token);
+        let err = list_types(&req, &auth).unwrap_err();
+        assert_eq!(err.0, 401);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn enforced_mode_with_a_valid_token_enforces_abac_rather_than_raw_access() {
+        // No policies exist for this subject, so an enforced query must
+        // see nothing even though the entity exists — proving this path
+        // actually goes through query_enforced, not the raw store.
+        let dir = tmp_dir("enforced_sees_nothing_without_policy");
+        seed(&dir);
+        let secret = b"test-secret".to_vec();
+        let subject = SubjectContext {
+            subject_id: Tuid::generate(),
+            roles: vec![],
+        };
+        let token = gems_abac::token::issue(&secret, &subject, None);
+        let auth = AuthMode::Enforced { secret };
+        let req = bearer_req(
+            &[
+                ("store_dir", dir.to_str().unwrap()),
+                ("q", "SELECT * FROM entities WHERE type IN (widget)"),
+            ],
+            &token,
+        );
+        let result = query(&req, &auth).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 

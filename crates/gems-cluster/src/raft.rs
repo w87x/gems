@@ -584,6 +584,7 @@ pub mod wire {
     use super::{Envelope, LogEntry, NodeId, Rpc, Term};
     use crate::frame::check_frame_len;
     use crate::record::LogRecord;
+    use gems_common::hmac::{constant_time_eq, hmac_sha256, TAG_LEN};
     use gems_common::{Error, Result};
 
     const REQUEST_VOTE_REQUEST: u8 = 1;
@@ -591,7 +592,18 @@ pub mod wire {
     const APPEND_ENTRIES_REQUEST: u8 = 3;
     const APPEND_ENTRIES_RESPONSE: u8 = 4;
 
-    pub fn encode(envelope: &Envelope) -> Vec<u8> {
+    /// Encodes and HMAC-SHA256-tags `envelope` with the cluster's shared
+    /// `secret`: `u32 payload_len | payload | 32-byte tag`, where
+    /// `tag = HMAC-SHA256(secret, payload)`. Without this, any TCP client
+    /// that can reach a node's peer port could speak Raft to it directly —
+    /// forge votes, propose bogus committed entries, or otherwise
+    /// participate in consensus without being a configured cluster member.
+    /// A shared secret is a deliberately simple scheme (matches this
+    /// workspace's "avoid third-party crates" rule — hand-rolling a real
+    /// PKI/mTLS setup is a much bigger undertaking than a cluster of
+    /// operator-trusted nodes needs) that at least requires knowing the
+    /// cluster's secret to inject or tamper with peer traffic.
+    pub fn encode(envelope: &Envelope, secret: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&envelope.from.to_le_bytes());
         payload.extend_from_slice(&envelope.to.to_le_bytes());
@@ -651,25 +663,39 @@ pub mod wire {
                 payload.extend_from_slice(&follower_id.to_le_bytes());
             }
         }
-        let mut framed = Vec::with_capacity(4 + payload.len());
+        let tag = hmac_sha256(secret, &payload);
+        let mut framed = Vec::with_capacity(4 + payload.len() + TAG_LEN);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(&payload);
+        framed.extend_from_slice(&tag);
         framed
     }
 
-    /// Decode one envelope from the start of `buf`. `None` (not an error)
-    /// if `buf` doesn't yet hold a complete envelope.
-    pub fn decode(buf: &[u8]) -> Result<Option<(Envelope, usize)>> {
+    /// Decode one authenticated envelope from the start of `buf`. `None`
+    /// (not an error) if `buf` doesn't yet hold a complete framed envelope
+    /// (length prefix + payload + tag). Returns an error both for the
+    /// usual malformed-payload reasons and for a tag that doesn't match
+    /// `secret` — the latter meaning either data corruption or a sender
+    /// that doesn't know this cluster's secret, treated the same way
+    /// (reject the frame) either way.
+    pub fn decode(buf: &[u8], secret: &[u8]) -> Result<Option<(Envelope, usize)>> {
         if buf.len() < 4 {
             return Ok(None);
         }
         let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         check_frame_len(payload_len, "Raft envelope exceeds the maximum frame size")?;
-        let total_len = 4 + payload_len;
+        let total_len = 4 + payload_len + TAG_LEN;
         if buf.len() < total_len {
             return Ok(None);
         }
-        let payload = &buf[4..total_len];
+        let payload = &buf[4..4 + payload_len];
+        let received_tag = &buf[4 + payload_len..total_len];
+        let expected_tag = hmac_sha256(secret, payload);
+        if !constant_time_eq(&expected_tag, received_tag) {
+            return Err(Error::InvalidValue {
+                detail: "Raft envelope authentication tag mismatch",
+            });
+        }
         let mut pos = 0;
         let from = read_node_id(payload, &mut pos)?;
         let to = read_node_id(payload, &mut pos)?;
@@ -787,6 +813,8 @@ pub mod wire {
         use crate::record::LogRecord;
         use gems_common::Tuid;
 
+        const SECRET: &[u8] = b"test-cluster-secret";
+
         fn sample_entries() -> Vec<LogEntry> {
             vec![
                 LogEntry {
@@ -810,7 +838,7 @@ pub mod wire {
                 .to_le_bytes()
                 .to_vec();
             buf.push(1);
-            assert!(decode(&buf).is_err());
+            assert!(decode(&buf, SECRET).is_err());
         }
 
         #[test]
@@ -818,6 +846,8 @@ pub mod wire {
             // A crafted AppendEntries claiming e.g. a billion entries but
             // with a payload far too small to actually hold them must be
             // rejected before `Vec::with_capacity` ever sees that count.
+            // Tagged with the real secret so this actually exercises the
+            // entry-count check rather than just failing tag verification.
             let mut payload = Vec::new();
             payload.extend_from_slice(&1u32.to_le_bytes()); // from
             payload.extend_from_slice(&2u32.to_le_bytes()); // to
@@ -829,7 +859,23 @@ pub mod wire {
             payload.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // entry_count
             let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
             framed.extend_from_slice(&payload);
-            assert!(decode(&framed).is_err());
+            framed.extend_from_slice(&hmac_sha256(SECRET, &payload));
+            assert!(decode(&framed, SECRET).is_err());
+        }
+
+        #[test]
+        fn decode_rejects_a_frame_tagged_with_the_wrong_secret() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                rpc: Rpc::RequestVoteResponse {
+                    term: 1,
+                    vote_granted: true,
+                    voter_id: 1,
+                },
+            };
+            let encoded = encode(&env, SECRET);
+            assert!(decode(&encoded, b"wrong-secret").is_err());
         }
 
         #[test]
@@ -844,8 +890,8 @@ pub mod wire {
                     last_log_term: 4,
                 },
             };
-            let encoded = encode(&env);
-            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            let encoded = encode(&env, SECRET);
+            let (decoded, consumed) = decode(&encoded, SECRET).unwrap().unwrap();
             assert_eq!(consumed, encoded.len());
             assert_eq!(decoded, env);
         }
@@ -864,8 +910,8 @@ pub mod wire {
                     leader_commit: 3,
                 },
             };
-            let encoded = encode(&env);
-            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            let encoded = encode(&env, SECRET);
+            let (decoded, consumed) = decode(&encoded, SECRET).unwrap().unwrap();
             assert_eq!(consumed, encoded.len());
             assert_eq!(decoded, env);
         }
@@ -882,8 +928,8 @@ pub mod wire {
                     follower_id: 2,
                 },
             };
-            let encoded = encode(&env);
-            let (decoded, _) = decode(&encoded).unwrap().unwrap();
+            let encoded = encode(&env, SECRET);
+            let (decoded, _) = decode(&encoded, SECRET).unwrap().unwrap();
             assert_eq!(decoded, env);
         }
 
@@ -898,8 +944,10 @@ pub mod wire {
                     voter_id: 1,
                 },
             };
-            let encoded = encode(&env);
-            assert!(decode(&encoded[..encoded.len() - 1]).unwrap().is_none());
+            let encoded = encode(&env, SECRET);
+            assert!(decode(&encoded[..encoded.len() - 1], SECRET)
+                .unwrap()
+                .is_none());
         }
 
         #[test]
@@ -922,10 +970,10 @@ pub mod wire {
                     voter_id: 2,
                 },
             };
-            let mut buf = encode(&a);
-            buf.extend_from_slice(&encode(&b));
-            let (decoded_a, consumed_a) = decode(&buf).unwrap().unwrap();
-            let (decoded_b, consumed_b) = decode(&buf[consumed_a..]).unwrap().unwrap();
+            let mut buf = encode(&a, SECRET);
+            buf.extend_from_slice(&encode(&b, SECRET));
+            let (decoded_a, consumed_a) = decode(&buf, SECRET).unwrap().unwrap();
+            let (decoded_b, consumed_b) = decode(&buf[consumed_a..], SECRET).unwrap().unwrap();
             assert_eq!(decoded_a, a);
             assert_eq!(decoded_b, b);
             assert_eq!(consumed_a + consumed_b, buf.len());

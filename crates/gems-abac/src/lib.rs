@@ -15,10 +15,13 @@ use gems_catalog::{Effect, EntityHeader, Policy};
 use gems_codec::GbvReader;
 use gems_common::Tuid;
 
+pub mod token;
+
 /// The acting subject for a decision: their own id, plus every role they
 /// hold (roles are resolved by the caller — this crate doesn't know how
 /// group/role membership is stored, per ARCHITECTURE.md §5.4's
 /// one-direction-of-truth membership model).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubjectContext {
     pub subject_id: Tuid,
     pub roles: Vec<Tuid>,

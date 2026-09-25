@@ -34,6 +34,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -112,7 +113,9 @@ pub struct RaftTiming {
 /// `listen_addr` for inbound peer RPCs and `client_listen_addr` for
 /// inbound client propose requests (see `propose_remote`), and spawns
 /// both accept loops plus the engine thread. `peers` maps every *other*
-/// node's id to its (peer) address.
+/// node's id to its (peer) address. `secret` authenticates peer traffic —
+/// see `raft::wire::encode`'s doc — and must be the same across every
+/// node in the cluster.
 pub fn spawn(
     id: NodeId,
     listen_addr: &str,
@@ -120,6 +123,7 @@ pub fn spawn(
     peers: HashMap<NodeId, SocketAddr>,
     store_dir: &std::path::Path,
     timing: RaftTiming,
+    secret: Arc<Vec<u8>>,
 ) -> Result<RaftNodeHandle> {
     let RaftTiming {
         tick_interval,
@@ -135,12 +139,14 @@ pub fn spawn(
     // Peer accept loop: one thread per connection, each decoding envelopes
     // off its socket and forwarding them into the engine's inbound channel.
     let accept_sender = to_engine.clone();
+    let accept_secret = Arc::clone(&secret);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
             let sender = accept_sender.clone();
+            let secret = Arc::clone(&accept_secret);
             thread::spawn(move || {
-                let _ = handle_connection(stream, sender);
+                let _ = handle_connection(stream, sender, &secret);
             });
         }
     });
@@ -168,7 +174,7 @@ pub fn spawn(
     let core = RaftCore::new(id, peer_ids, jittered, heartbeat_interval_ticks);
 
     let join = thread::spawn(move || {
-        run_engine(core, store, peers, from_network, tick_interval);
+        run_engine(core, store, peers, from_network, tick_interval, secret);
     });
 
     Ok(RaftNodeHandle {
@@ -177,7 +183,7 @@ pub fn spawn(
     })
 }
 
-fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()> {
+fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>, secret: &[u8]) -> Result<()> {
     let mut reader = stream;
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -187,7 +193,7 @@ fn handle_connection(stream: TcpStream, sender: Sender<EngineMsg>) -> Result<()>
             return Ok(());
         }
         buf.extend_from_slice(&chunk[..n]);
-        while let Some((envelope, consumed)) = wire::decode(&buf)? {
+        while let Some((envelope, consumed)) = wire::decode(&buf, secret)? {
             let _ = sender.send(EngineMsg::Inbound(envelope));
             buf.drain(..consumed);
         }
@@ -258,14 +264,14 @@ pub fn propose_remote(addr: SocketAddr, command: &LogRecord, timeout: Duration) 
     Ok(u64::from_le_bytes(response[1..9].try_into().unwrap()))
 }
 
-fn send_envelope(addr: SocketAddr, envelope: &Envelope) {
+fn send_envelope(addr: SocketAddr, envelope: &Envelope, secret: &[u8]) {
     // Best-effort: a send failure (peer down, network partition) is
     // exactly the condition Raft is designed to tolerate — the tick loop
     // will simply retry on the next heartbeat/election timeout. Logging
     // it is a real deployment's job (this shell has no logging story
     // yet); silently dropping is the correct *algorithmic* response.
     if let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
-        let _ = stream.write_all(&wire::encode(envelope));
+        let _ = stream.write_all(&wire::encode(envelope, secret));
     }
 }
 
@@ -287,6 +293,7 @@ fn run_engine(
     peers: HashMap<NodeId, SocketAddr>,
     inbound: Receiver<EngineMsg>,
     tick_interval: Duration,
+    secret: Arc<Vec<u8>>,
 ) {
     loop {
         let outgoing = match inbound.recv_timeout(tick_interval) {
@@ -311,7 +318,7 @@ fn run_engine(
 
         for envelope in outgoing {
             if let Some(&addr) = peers.get(&envelope.to) {
-                send_envelope(addr, &envelope);
+                send_envelope(addr, &envelope, &secret);
             }
         }
 
@@ -327,6 +334,10 @@ mod tests {
     use gems_catalog::{EntityFlags, EntityHeader, EntityKind};
     use gems_common::Tuid;
     use std::path::PathBuf;
+
+    fn test_secret() -> Arc<Vec<u8>> {
+        Arc::new(b"test-cluster-secret".to_vec())
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -403,6 +414,7 @@ mod tests {
                     heartbeat_interval_ticks: 3,
                     election_timeout_ticks_range: (6, 10),
                 },
+                test_secret(),
             )
             .unwrap();
             handles.push((id, handle));
@@ -485,6 +497,7 @@ mod tests {
                     heartbeat_interval_ticks: 3,
                     election_timeout_ticks_range: (6, 10),
                 },
+                test_secret(),
             )
             .unwrap();
             handles.push((id, handle));

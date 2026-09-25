@@ -8,3 +8,4 @@ license.workspace = true
 gems-common = { path = "../gems-common" }
 gems-catalog = { path = "../gems-catalog" }
 gems-codec = { path = "../gems-codec" }
+gems-json = { path = "../gems-json" }

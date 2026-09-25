@@ -2,10 +2,13 @@
 //! checksums, and the workspace-wide error type. See `ARCHITECTURE.md` at
 //! the repo root for the rationale behind each of these.
 
+pub mod base64url;
 pub mod crc32c;
 pub mod filelock;
+pub mod hmac;
 pub mod pagesize;
 pub mod rand;
+pub mod sha256;
 pub mod tuid;
 
 pub use tuid::Tuid;

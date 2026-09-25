@@ -427,12 +427,18 @@ impl SwimCore {
 pub mod wire {
     use super::{Envelope, GossipItem, Incarnation, NodeId, Status, SwimMessage};
     use crate::frame::check_frame_len;
+    use gems_common::hmac::{constant_time_eq, hmac_sha256, TAG_LEN};
     use gems_common::{Error, Result};
 
     const PING: u8 = 1;
     const ACK: u8 = 2;
 
-    pub fn encode(envelope: &Envelope) -> Vec<u8> {
+    /// Encodes and HMAC-SHA256-tags `envelope` with the cluster's shared
+    /// `secret` — same framing and same rationale as `raft::wire::encode`:
+    /// without this, any TCP client reachable on a node's gossip port
+    /// could inject SWIM messages and manipulate this node's membership
+    /// view (falsely mark a live peer dead, or vice versa).
+    pub fn encode(envelope: &Envelope, secret: &[u8]) -> Vec<u8> {
         let mut payload = Vec::new();
         payload.extend_from_slice(&envelope.from.to_le_bytes());
         payload.extend_from_slice(&envelope.to.to_le_bytes());
@@ -454,9 +460,11 @@ pub mod wire {
                 encode_ping_or_ack_body(&mut payload, *seq, *sender_incarnation, gossip);
             }
         }
-        let mut framed = Vec::with_capacity(4 + payload.len());
+        let tag = hmac_sha256(secret, &payload);
+        let mut framed = Vec::with_capacity(4 + payload.len() + TAG_LEN);
         framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         framed.extend_from_slice(&payload);
+        framed.extend_from_slice(&tag);
         framed
     }
 
@@ -497,19 +505,28 @@ pub mod wire {
         })
     }
 
-    /// Decode one envelope from the start of `buf`. `None` (not an error)
-    /// if `buf` doesn't yet hold a complete envelope.
-    pub fn decode(buf: &[u8]) -> Result<Option<(Envelope, usize)>> {
+    /// Decode one authenticated envelope from the start of `buf`. `None`
+    /// (not an error) if `buf` doesn't yet hold a complete framed envelope.
+    /// Errors both for the usual malformed-payload reasons and for a tag
+    /// that doesn't match `secret`.
+    pub fn decode(buf: &[u8], secret: &[u8]) -> Result<Option<(Envelope, usize)>> {
         if buf.len() < 4 {
             return Ok(None);
         }
         let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
         check_frame_len(payload_len, "SWIM envelope exceeds the maximum frame size")?;
-        let total_len = 4 + payload_len;
+        let total_len = 4 + payload_len + TAG_LEN;
         if buf.len() < total_len {
             return Ok(None);
         }
-        let payload = &buf[4..total_len];
+        let payload = &buf[4..4 + payload_len];
+        let received_mac = &buf[4 + payload_len..total_len];
+        let expected_mac = hmac_sha256(secret, payload);
+        if !constant_time_eq(&expected_mac, received_mac) {
+            return Err(Error::InvalidValue {
+                detail: "SWIM envelope authentication tag mismatch",
+            });
+        }
         let mut pos = 0;
         let from = read_node_id(payload, &mut pos)?;
         let to = read_node_id(payload, &mut pos)?;
@@ -605,13 +622,15 @@ pub mod wire {
     mod tests {
         use super::*;
 
+        const SECRET: &[u8] = b"test-cluster-secret";
+
         #[test]
         fn decode_rejects_a_claimed_length_over_the_frame_cap() {
             let mut buf = ((crate::frame::MAX_FRAME_LEN as u32) + 1)
                 .to_le_bytes()
                 .to_vec();
             buf.push(1);
-            assert!(decode(&buf).is_err());
+            assert!(decode(&buf, SECRET).is_err());
         }
 
         #[test]
@@ -625,7 +644,23 @@ pub mod wire {
             payload.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // gossip count
             let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
             framed.extend_from_slice(&payload);
-            assert!(decode(&framed).is_err());
+            framed.extend_from_slice(&hmac_sha256(SECRET, &payload));
+            assert!(decode(&framed, SECRET).is_err());
+        }
+
+        #[test]
+        fn decode_rejects_a_frame_tagged_with_the_wrong_secret() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                message: SwimMessage::Ack {
+                    seq: 1,
+                    sender_incarnation: 0,
+                    gossip: vec![],
+                },
+            };
+            let encoded = encode(&env, SECRET);
+            assert!(decode(&encoded, b"wrong-secret").is_err());
         }
 
         #[test]
@@ -650,8 +685,8 @@ pub mod wire {
                     ],
                 },
             };
-            let encoded = encode(&env);
-            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            let encoded = encode(&env, SECRET);
+            let (decoded, consumed) = decode(&encoded, SECRET).unwrap().unwrap();
             assert_eq!(consumed, encoded.len());
             assert_eq!(decoded, env);
         }
@@ -667,8 +702,8 @@ pub mod wire {
                     gossip: vec![],
                 },
             };
-            let encoded = encode(&env);
-            let (decoded, _) = decode(&encoded).unwrap().unwrap();
+            let encoded = encode(&env, SECRET);
+            let (decoded, _) = decode(&encoded, SECRET).unwrap().unwrap();
             assert_eq!(decoded, env);
         }
 
@@ -683,8 +718,10 @@ pub mod wire {
                     gossip: vec![],
                 },
             };
-            let encoded = encode(&env);
-            assert!(decode(&encoded[..encoded.len() - 1]).unwrap().is_none());
+            let encoded = encode(&env, SECRET);
+            assert!(decode(&encoded[..encoded.len() - 1], SECRET)
+                .unwrap()
+                .is_none());
         }
 
         #[test]
@@ -707,10 +744,10 @@ pub mod wire {
                     gossip: vec![],
                 },
             };
-            let mut buf = encode(&a);
-            buf.extend_from_slice(&encode(&b));
-            let (decoded_a, consumed_a) = decode(&buf).unwrap().unwrap();
-            let (decoded_b, consumed_b) = decode(&buf[consumed_a..]).unwrap().unwrap();
+            let mut buf = encode(&a, SECRET);
+            buf.extend_from_slice(&encode(&b, SECRET));
+            let (decoded_a, consumed_a) = decode(&buf, SECRET).unwrap().unwrap();
+            let (decoded_b, consumed_b) = decode(&buf[consumed_a..], SECRET).unwrap().unwrap();
             assert_eq!(decoded_a, a);
             assert_eq!(decoded_b, b);
             assert_eq!(consumed_a + consumed_b, buf.len());
