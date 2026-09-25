@@ -3,6 +3,7 @@
 //! the repo root for the rationale behind each of these.
 
 pub mod crc32c;
+pub mod filelock;
 pub mod pagesize;
 pub mod rand;
 pub mod tuid;
@@ -14,11 +15,25 @@ pub use tuid::Tuid;
 #[derive(Debug)]
 pub enum Error {
     Io(std::io::Error),
-    CorruptExtent { detail: &'static str },
-    CorruptPage { detail: &'static str },
+    CorruptExtent {
+        detail: &'static str,
+    },
+    CorruptPage {
+        detail: &'static str,
+    },
     OutOfSpace,
     NotFound,
-    InvalidValue { detail: &'static str },
+    InvalidValue {
+        detail: &'static str,
+    },
+    /// A writable open/create found another process already holding this
+    /// store directory's exclusive lock (see `gems-engine::Store`'s module
+    /// doc). Two writers racing on the same store's CoW page allocation
+    /// and root-pointer publish would corrupt it, so this is refused
+    /// rather than attempted.
+    AlreadyLocked {
+        path: std::path::PathBuf,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -30,6 +45,11 @@ impl std::fmt::Display for Error {
             Error::OutOfSpace => write!(f, "out of space"),
             Error::NotFound => write!(f, "not found"),
             Error::InvalidValue { detail } => write!(f, "invalid value: {detail}"),
+            Error::AlreadyLocked { path } => write!(
+                f,
+                "store at {} is already open (writable) in another process",
+                path.display()
+            ),
         }
     }
 }

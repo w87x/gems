@@ -38,6 +38,28 @@
 //!   replication stream all legitimately need raw access), so ABAC is
 //!   something a caller opts into per read, not a mode the whole store is
 //!   switched into.
+//!
+//! **Concurrency contract**: a `Store` is not `Sync` in any load-bearing
+//! sense — every mutating method takes `&mut self`, so within one process
+//! the borrow checker already forces external synchronization (a
+//! `Mutex<Store>`, or a single owning thread) around concurrent access.
+//! Across *processes*, nothing before this comment stopped two of them
+//! from opening the same directory writable at once — the copy-on-write
+//! page allocator and in-memory freelist state in `gems-index::Pager` and
+//! `gems-storage::ExtentManager` both assume they're the only writer, so
+//! two independent writers racing would corrupt the store (one reusing a
+//! page or extent slot the other just allocated, both computing an
+//! inconsistent freelist). `create`/`open(_, writable: true)` now take an
+//! exclusive, non-blocking `gems_common::filelock` on the store directory
+//! and hold it for the `Store`'s lifetime, so a second writable open from
+//! any process — including a stray second instance of the same process —
+//! fails fast with `Error::AlreadyLocked` instead of corrupting data.
+//! `open(_, writable: false)` does not lock: concurrent read-only opens
+//! are not the corruption scenario this guards against, and forbidding
+//! them would break the (already-relied-on, e.g. in
+//! `gems-cluster`'s integration tests) pattern of peeking at a store's
+//! persisted state from a second, short-lived, read-only `Store` while
+//! another process's writer keeps it open.
 
 mod ordinal;
 mod secondary;
@@ -45,6 +67,7 @@ mod secondary;
 use std::path::{Path, PathBuf};
 
 use gems_catalog::{EntityHeader, EntityKind};
+use gems_common::filelock::FileLock;
 use gems_common::{Error, Result, Tuid};
 use gems_index::BTree;
 use gems_query::{Expr, Literal, Query};
@@ -77,6 +100,10 @@ pub struct Store {
     /// entities — how the planner resolves a bare `type IN (widget, ...)`
     /// name to the TUID `by_schema_ref` is keyed on.
     entity_type_by_name: SecondaryIndex,
+    /// Held only for a writable `Store` (see the crate doc's concurrency
+    /// contract) — `None` for a read-only open. Releases automatically on
+    /// `Drop`.
+    _lock: Option<FileLock>,
 }
 
 fn kind_key(kind: EntityKind) -> Vec<u8> {
@@ -95,6 +122,10 @@ impl Store {
     /// Create a fresh store rooted at `dir` (created if it doesn't exist).
     pub fn create(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
+        // Acquired before any file in `dir` is touched, so a second
+        // process racing to `create`/`open(_, true)` the same directory
+        // fails here rather than after already allocating pages.
+        let lock = gems_common::filelock::acquire_exclusive_in_dir(dir)?;
         let primary = BTree::create(&primary_index_path(dir), DEFAULT_INDEX_PAGE_SIZE)?;
         let ordinal_by_id = BTree::create(&ordinal_index_path(dir), DEFAULT_INDEX_PAGE_SIZE)?;
         let id_by_ordinal =
@@ -109,10 +140,17 @@ impl Store {
             by_kind: SecondaryIndex::new(),
             by_schema_ref: SecondaryIndex::new(),
             entity_type_by_name: SecondaryIndex::new(),
+            _lock: Some(lock),
         })
     }
 
     pub fn open(dir: &Path, writable: bool) -> Result<Self> {
+        // See the crate doc's concurrency contract: only a writable open
+        // takes the exclusive lock. A read-only open is intentionally
+        // lock-free.
+        let lock = writable
+            .then(|| gems_common::filelock::acquire_exclusive_in_dir(dir))
+            .transpose()?;
         let primary = BTree::open(&primary_index_path(dir), writable)?;
         let ordinal_by_id = BTree::open(&ordinal_index_path(dir), writable)?;
         let id_by_ordinal = BTree::open(&reverse_ordinal_index_path(dir), writable)?;
@@ -127,6 +165,7 @@ impl Store {
             by_kind: SecondaryIndex::new(),
             by_schema_ref: SecondaryIndex::new(),
             entity_type_by_name: SecondaryIndex::new(),
+            _lock: lock,
         };
         store.rebuild_in_memory_indexes()?;
         Ok(store)
@@ -461,6 +500,53 @@ mod tests {
         let mut b = GbvBuilder::new();
         b.push(1, TypeTag::Str, status.as_bytes());
         b.finish()
+    }
+
+    #[test]
+    fn a_second_writable_open_of_the_same_store_is_refused() {
+        let dir = tmp_dir("second_writer_refused");
+        let _first = Store::create(&dir).unwrap();
+        let second = Store::open(&dir, true);
+        assert!(
+            matches!(second, Err(Error::AlreadyLocked { .. })),
+            "a second writable open must fail fast instead of risking corrupting the store"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_writable_open_succeeds_again_once_the_first_is_dropped() {
+        let dir = tmp_dir("writer_after_drop");
+        {
+            let _first = Store::create(&dir).unwrap();
+        }
+        assert!(Store::open(&dir, true).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_only_opens_do_not_take_the_lock_and_can_coexist_with_a_writer() {
+        let dir = tmp_dir("readers_coexist_with_writer");
+        let id = Tuid::new([3u8; 16], 3);
+        let type_id = Tuid::new([4u8; 16], 4);
+        let writer = {
+            let mut store = Store::create(&dir).unwrap();
+            store
+                .insert(
+                    sample_header(id, "w", EntityKind::Data, type_id),
+                    &gbv_body("active"),
+                )
+                .unwrap();
+            store
+        };
+        // The writer is still open (not dropped) — a read-only open of the
+        // same directory must still succeed, unlike a writable one.
+        let reader1 = Store::open(&dir, false).unwrap();
+        let reader2 = Store::open(&dir, false).unwrap();
+        assert!(reader1.get(&id).unwrap().is_some());
+        assert!(reader2.get(&id).unwrap().is_some());
+        drop(writer);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
