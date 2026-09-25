@@ -40,6 +40,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-index"
+version = "0.1.0"
+dependencies = [
+ "gems-common",
+ "gems-storage",
+ "rustix",
+]
+
+[[package]]
 name = "gems-storage"
 version = "0.1.0"
 dependencies = [

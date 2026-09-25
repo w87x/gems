@@ -5,6 +5,7 @@ members = [
     "crates/gems-storage",
     "crates/gems-codec",
     "crates/gems-catalog",
+    "crates/gems-index",
 ]
 
 [workspace.package]

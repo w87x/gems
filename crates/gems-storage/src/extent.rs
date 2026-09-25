@@ -28,8 +28,7 @@ impl BlockClass {
     pub const COUNT: u8 = 16;
 
     pub fn from_block_size(block_size: u32) -> Result<Self> {
-        if !block_size.is_power_of_two()
-            || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size)
+        if !block_size.is_power_of_two() || !(MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size)
         {
             return Err(Error::InvalidValue {
                 detail: "block size must be a power of two between 512B and 16MiB",

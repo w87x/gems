@@ -37,7 +37,10 @@ fn grow_write_reopen_roundtrip() {
         let file = ExtentFile::open(&path, false).unwrap();
         assert_eq!(file.len() as u64, EXTENT_SIZE);
         let slice = file.as_slice();
-        assert_eq!(u32::from_le_bytes(slice[0..4].try_into().unwrap()), gems_storage::extent::EXTENT_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(slice[0..4].try_into().unwrap()),
+            gems_storage::extent::EXTENT_MAGIC
+        );
         let mut bitmap_copy = slice[HEADER_FIELDS_SIZE..BITMAP_BYTES].to_vec();
         let bm = Bitmap::new(&mut bitmap_copy);
         assert!(bm.is_allocated(0));

@@ -20,13 +20,8 @@ pub const DESCRIPTION_MAX: usize = 254;
 /// (modified_by) + 8 (modified_at) + 1 (name_len) + 63 (name) + 2
 /// (desc_len) + 254 (description) + 4 (flags) + 1 (entity_kind) + 24
 /// (schema_ref) + 4 (body_offset) + 4 (body_len) + 4 (checksum)`.
-pub const ENCODED_LEN: usize = 4 + 2 + 24 + 16 + 16 + 8 + 1 + NAME_MAX + 2 + DESCRIPTION_MAX
-    + 4
-    + 1
-    + 24
-    + 4
-    + 4
-    + 4;
+pub const ENCODED_LEN: usize =
+    4 + 2 + 24 + 16 + 16 + 8 + 1 + NAME_MAX + 2 + DESCRIPTION_MAX + 4 + 1 + 24 + 4 + 4 + 4;
 
 #[derive(Debug, Clone)]
 pub struct EntityHeader {
@@ -117,7 +112,8 @@ impl EntityHeader {
         let description = String::from_utf8_lossy(&buf[pos..pos + desc_len]).into_owned();
         pos += DESCRIPTION_MAX;
 
-        let flags = EntityFlags::from_bits(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
+        let flags =
+            EntityFlags::from_bits(u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()));
         pos += 4;
         let entity_kind = EntityKind::from_u8(buf[pos])?;
         pos += 1;

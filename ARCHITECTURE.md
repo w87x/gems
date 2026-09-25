@@ -150,16 +150,28 @@ both siblings are also full.
   without straddling concerns — see §0 on decoupling logical vs OS page
   size).
 - Copy-on-write: a page is never mutated in place once published. An
-  update allocates a fresh page (from the same slab-style extent allocator
-  as §1, using a page-sized block class), writes the new version, and the
-  change propagates up to a new root. The file header holds two root
-  pointers (`root_a`, `root_b`) and a 1-bit "which is current" flag +
-  sequence number; publishing a new root = write it, `msync`, then flip the
-  flag with a single aligned write, `msync` again. Old pages become
-  free once no reader holds them (single-writer model makes this trivial:
-  free immediately after the swap, since there are no long-lived MVCC
-  readers of stale roots by design — see note below if you want snapshot
-  reads).
+  update allocates a fresh page (bump allocator + freelist over the index
+  file's own logical pages — the `gems-index` crate's `Pager`, distinct
+  from the §1 data-extent allocator since index pages are much smaller and
+  fixed-size) for every node along the root-to-leaf path, writes the new
+  version, and the change propagates up to a new root. Publishing a new
+  root is a single aligned 4-byte write of the root page id into the file
+  header (atomic on both target platforms — no need for a two-slot
+  `root_a`/`root_b` double buffer, since the write itself is already
+  word-atomic) followed by `msync`. Only *after* that publish are the old
+  (now-superseded) pages along the path returned to the freelist —
+  reachable-only-from-the-old-root pages are the exact set of pages a
+  single-writer, no-long-lived-snapshot design can free immediately.
+- **No leaf sibling ("next leaf") chain.** A tempting optimization for
+  range scans, but incompatible with copying only the root-to-leaf path:
+  replacing a leaf changes its page id, so a linked-list predecessor would
+  need updating too — cascading a supposedly-localized CoW update into an
+  unrelated sibling subtree. `gems-index` learned this the hard way (an
+  early implementation had a leaf silently point at a freed page after its
+  sibling was updated); scans instead recurse through the tree structure
+  itself, which stays correct under CoW for free. Revisit only if a
+  workload needs O(1) leaf-to-leaf stepping badly enough to justify
+  rewriting the whole predecessor chain on every leaf update.
 - If you want consistent point-in-time reads for query execution (you do,
   for ABAC + query correctness), take the current root pointer once at
   query start and read through it — CoW guarantees it stays valid even as

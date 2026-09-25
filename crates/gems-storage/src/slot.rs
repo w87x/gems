@@ -2,7 +2,7 @@
 //! ARCHITECTURE.md §1.3. This is what the primary and secondary indexes
 //! store as their "value" half.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SlotPointer {
     pub file_id: u32,
     pub extent_index: u32,

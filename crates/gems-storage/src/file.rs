@@ -125,13 +125,21 @@ impl ExtentFile {
     /// Flush a byte range back to disk. Callers should call this after
     /// mutating extent headers/bitmaps or index pages before treating the
     /// write as durable (ARCHITECTURE.md §1.4).
+    ///
+    /// `msync` requires its address argument to be OS-page-aligned
+    /// (POSIX), so the requested range is rounded out to page boundaries
+    /// before the call.
     pub fn sync_range(&self, offset: usize, len: usize) -> Result<()> {
-        // SAFETY: `offset..offset+len` must lie within the current mapping;
-        // callers are internal to this crate and uphold that.
+        let page = gems_common::pagesize::os_page_size();
+        let aligned_start = offset & !(page - 1);
+        let aligned_end = round_up_to_os_page(offset + len);
+        let aligned_len = (aligned_end - aligned_start).min(self.mapped_len - aligned_start);
+        // SAFETY: `aligned_start..aligned_start+aligned_len` lies within
+        // the current mapping by construction above.
         unsafe {
             mm::msync(
-                self.map.as_ptr().add(offset) as *mut _,
-                len,
+                self.map.as_ptr().add(aligned_start) as *mut _,
+                aligned_len,
                 mm::MsyncFlags::SYNC,
             )
             .map_err(std::io::Error::from)?;
