@@ -10,10 +10,23 @@
 //! secret used to verify each call's `auth_token` argument), or `--insecure`
 //! is passed on the command line — which restores raw, unauthenticated
 //! access and prints a loud warning, for local testing only.
+//!
+//! **Shutdown**: unlike `gems-webui`, this process needs no special
+//! `SIGTERM`/`SIGINT` handling to shut down gracefully — it holds no
+//! resource across calls (each tool call opens its `Store` read-only, per
+//! `tools.rs`, so it never takes the store's directory lock), and EOF on
+//! stdin (its MCP client disconnecting) already ends the main loop
+//! cleanly. Default signal termination is already safe here.
+//!
+//! **Logging**: diagnostic messages go through `gems_common::logging`
+//! (leveled, controlled by `$GEMS_LOG`) — this binary's stdout is the
+//! MCP JSON-RPC protocol itself and must never carry anything else, so
+//! all diagnostics go to stderr via the logger, never `println!`.
 
 use std::io::{self, BufRead, Read, Write};
 
 use gems_abac::token::AuthMode;
+use gems_common::{log_error, log_warn};
 
 /// `BufRead::read_line`/`lines()` has no length limit: a client that never
 /// sends a newline makes it buffer unboundedly. stdio is normally a
@@ -23,13 +36,15 @@ use gems_abac::token::AuthMode;
 /// line-based reads.
 const MAX_LINE_LEN: u64 = 16 * 1024 * 1024;
 const SECRET_ENV_VAR: &str = "GEMS_MCP_SECRET";
+const LOG_TARGET: &str = "gems-mcp";
 
 fn main() {
     let insecure = std::env::args().any(|a| a == "--insecure");
     let auth = if insecure {
-        eprintln!(
-            "gems-mcp: running with --insecure — every tool call gets raw, unauthenticated, \
-             unenforced access. Do not use this outside local testing."
+        log_warn!(
+            LOG_TARGET,
+            "running with --insecure — every tool call gets raw, unauthenticated, unenforced \
+             access. Do not use this outside local testing."
         );
         AuthMode::Insecure
     } else {
@@ -38,10 +53,11 @@ fn main() {
                 secret: secret.into_bytes(),
             },
             _ => {
-                eprintln!(
-                    "gems-mcp: refusing to start without ${SECRET_ENV_VAR} set (the HMAC \
-                     secret used to verify each call's auth_token argument). Set it, or pass \
-                     --insecure to explicitly run without authentication (local testing only)."
+                log_error!(
+                    LOG_TARGET,
+                    "refusing to start without ${SECRET_ENV_VAR} set (the HMAC secret used to \
+                     verify each call's auth_token argument). Set it, or pass --insecure to \
+                     explicitly run without authentication (local testing only)."
                 );
                 std::process::exit(1);
             }
@@ -68,7 +84,10 @@ fn main() {
             // resuming line-sync without buffering it fully would misread
             // the remainder as the start of the next request. Terminate
             // instead of continuing in a desynced state.
-            eprintln!("gems-mcp: request line exceeds the maximum allowed length, closing stdio");
+            log_error!(
+                LOG_TARGET,
+                "request line exceeds the maximum allowed length, closing stdio"
+            );
             break;
         }
         let Ok(line) = String::from_utf8(buf) else {

@@ -20,7 +20,29 @@ use std::time::Duration;
 /// before returning.
 const MAX_LINE_LEN: u64 = 8 * 1024;
 const MAX_HEADER_LINES: usize = 200;
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
+
+/// The read timeout is the one operator-tunable knob here — a slower
+/// network path (a reverse proxy adding latency, a high-RTT client) might
+/// legitimately need longer than the 10s default without a rebuild; the
+/// length/count caps stay fixed constants since raising them only widens
+/// the resource-exhaustion window `MAX_LINE_LEN`/`MAX_HEADER_LINES` exist
+/// to bound, with no comparable legitimate reason to need a bigger value.
+fn read_timeout() -> Duration {
+    let raw = std::env::var("GEMS_WEBUI_READ_TIMEOUT_SECS").ok();
+    parse_read_timeout_secs(raw.as_deref())
+}
+
+/// Pure parsing logic, factored out so it's testable without mutating the
+/// real process environment (a hazard for tests that run in parallel
+/// within one process).
+fn parse_read_timeout_secs(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .unwrap_or(DEFAULT_READ_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 pub struct Request {
     pub method: String,
@@ -69,7 +91,7 @@ fn read_line_capped(reader: &mut impl BufRead) -> Result<String, String> {
 
 pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
     stream
-        .set_read_timeout(Some(READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout()))
         .map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let request_line = read_line_capped(&mut reader)?;
@@ -177,6 +199,28 @@ pub fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_read_timeout_secs_falls_back_to_the_default() {
+        assert_eq!(
+            parse_read_timeout_secs(None),
+            Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            parse_read_timeout_secs(Some("not a number")),
+            Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            parse_read_timeout_secs(Some("0")),
+            Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS),
+            "0 must fall back to the default, not disable the timeout entirely"
+        );
+    }
+
+    #[test]
+    fn parse_read_timeout_secs_honors_a_valid_override() {
+        assert_eq!(parse_read_timeout_secs(Some("30")), Duration::from_secs(30));
+    }
 
     #[test]
     fn url_decode_handles_percent_and_plus() {

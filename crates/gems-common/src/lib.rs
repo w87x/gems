@@ -6,9 +6,11 @@ pub mod base64url;
 pub mod crc32c;
 pub mod filelock;
 pub mod hmac;
+pub mod logging;
 pub mod pagesize;
 pub mod rand;
 pub mod sha256;
+pub mod shutdown;
 pub mod tuid;
 
 pub use tuid::Tuid;

@@ -692,6 +692,35 @@ gets a shortcut around policy enforcement.
   same `--insecure` escape hatch. Dispatch logic is split from the stdio
   loop (`protocol.rs`/`tools.rs` vs. a thin `main.rs`) for the same
   testability reason as the TUI's `app.rs` split.
+- **Operational basics for the two long-running services** (`gems-webui`,
+  `gems-mcp`): diagnostic output goes through `gems_common::logging`, a
+  hand-rolled leveled logger to stderr (`$GEMS_LOG` = `error`/`warn`/
+  `info`/`debug`, default `info`) — deliberately not used by `gems-cli`
+  or `gems-tui`, whose stdout/println! output *is* their user-facing
+  protocol, not diagnostic noise to gate behind a log level.
+  `gems-webui` also handles `SIGTERM`/`SIGINT` gracefully via
+  `gems_common::shutdown` (a hand-rolled handler over a raw `extern "C"`
+  binding to libc's `signal()` — every Rust binary already links libc, so
+  this needs no new dependency): the accept loop, polled non-blocking
+  rather than true signal-interrupted, stops taking new connections within
+  one poll interval rather than dying mid-response the way the default
+  `SIGTERM` behavior would. `gems-mcp` doesn't need this: it holds no
+  resource across calls (each opens its `Store` read-only) and already
+  exits cleanly on stdin EOF, so default signal termination is already
+  safe there. A handful of genuinely operator-tunable values (e.g.
+  `gems-webui`'s connection read timeout, via
+  `$GEMS_WEBUI_READ_TIMEOUT_SECS`) are environment-variable overridable;
+  the resource-limit constants from earlier hardening (frame-size caps,
+  header-count caps) deliberately stay fixed rather than configurable,
+  since raising them only widens the exhaustion window they exist to
+  bound, with no comparable legitimate reason an operator would need to.
+  **Not yet covered**: there is no standalone binary to run a
+  `gems-cluster` Raft/gossip node as a deployable process — `raft_net::
+  spawn`/`swim_net::spawn` are library entry points an embedding program
+  calls, not something `cargo run` starts directly today. Building that
+  (and its own graceful-shutdown story, which matters more there since a
+  node holds its store's write lock for its entire lifetime) is real,
+  separate follow-on work.
 
 ## 10. Crate layout
 

@@ -29,20 +29,50 @@
 //! for local testing only. There is no default secret: a server that
 //! silently fell back to one would give every deployment the same
 //! effective password.
+//!
+//! **Graceful shutdown**: `SIGTERM`/`SIGINT` (via `gems_common::shutdown`)
+//! stop the accept loop from taking new connections — already-accepted
+//! requests still get a response (each runs on its own detached thread,
+//! independent of the accept loop) — rather than the default "die
+//! mid-response" behavior an orchestrator's `SIGTERM` would otherwise
+//! cause. The listener is polled non-blocking rather than true
+//! signal-interrupted blocking `accept()`, so shutdown is prompt (within
+//! one poll interval) rather than instantaneous — a deliberate, documented
+//! simplicity/latency tradeoff, not a correctness concern (no lock or
+//! other resource is held across requests for a delayed shutdown to put
+//! at risk — see `gems-engine::Store`'s concurrency contract: this
+//! server's `Store::open` calls are always read-only, so they never take
+//! the store's directory lock in the first place).
+//!
+//! **Logging**: diagnostic/operational messages go through
+//! `gems_common::logging` (leveled, controlled by `$GEMS_LOG`) rather than
+//! ad hoc `println!`/`eprintln!` — this binary has no other output that
+//! needs to stay a stable, parseable protocol the way `gems-cli`'s stdout
+//! does, so all of it can be leveled diagnostic output.
 
 mod api;
 mod http;
 
 use std::net::{TcpListener, TcpStream};
 use std::thread;
+use std::time::Duration;
 
 use gems_abac::token::AuthMode;
+use gems_common::{log_error, log_info, log_warn};
 use http::{parse_request, write_response, Request};
 
 const INDEX_HTML: &str = include_str!("../assets/index.html");
 const SECRET_ENV_VAR: &str = "GEMS_WEBUI_SECRET";
+const LOG_TARGET: &str = "gems-webui";
+
+/// How often the accept loop wakes up to check for a shutdown signal when
+/// no connection is pending. Small enough that `SIGTERM` feels prompt,
+/// large enough not to busy-loop.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 fn main() {
+    gems_common::shutdown::install_handler();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let insecure = args.iter().any(|a| a == "--insecure");
     let addr = args
@@ -52,9 +82,10 @@ fn main() {
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
 
     let auth = if insecure {
-        eprintln!(
-            "gems-webui: running with --insecure — every request gets raw, unauthenticated, \
-             unenforced access. Do not use this outside local testing."
+        log_warn!(
+            LOG_TARGET,
+            "running with --insecure — every request gets raw, unauthenticated, unenforced \
+             access. Do not use this outside local testing."
         );
         AuthMode::Insecure
     } else {
@@ -63,10 +94,11 @@ fn main() {
                 secret: secret.into_bytes(),
             },
             _ => {
-                eprintln!(
-                    "gems-webui: refusing to start without ${SECRET_ENV_VAR} set (the HMAC \
-                     secret used to verify Authorization: Bearer tokens). Set it, or pass \
-                     --insecure to explicitly run without authentication (local testing only)."
+                log_error!(
+                    LOG_TARGET,
+                    "refusing to start without ${SECRET_ENV_VAR} set (the HMAC secret used to \
+                     verify Authorization: Bearer tokens). Set it, or pass --insecure to \
+                     explicitly run without authentication (local testing only)."
                 );
                 std::process::exit(1);
             }
@@ -74,13 +106,38 @@ fn main() {
     };
 
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
-        eprintln!("failed to bind {addr}: {e}");
+        log_error!(LOG_TARGET, "failed to bind {addr}: {e}");
         std::process::exit(1);
     });
-    println!("gems-webui listening on http://{addr}");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to set the listener non-blocking");
+    log_info!(LOG_TARGET, "listening on http://{addr}");
 
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        if gems_common::shutdown::shutdown_requested() {
+            log_info!(
+                LOG_TARGET,
+                "shutdown signal received, no longer accepting new connections"
+            );
+            break;
+        }
+        let stream = match stream {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL_INTERVAL);
+                continue;
+            }
+            Err(_) => continue,
+        };
+        // An accepted connection's non-blocking status isn't guaranteed to
+        // be independent of the listener's across all platforms — set it
+        // explicitly rather than relying on that, since the rest of this
+        // connection's handling (parse_request's read timeout, blocking
+        // writes) assumes ordinary blocking I/O.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let auth = auth.clone();
         thread::spawn(move || handle_connection(stream, &auth));
     }
