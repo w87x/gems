@@ -13,6 +13,7 @@ pub mod header;
 pub mod kind;
 pub mod layer;
 pub mod link;
+pub mod policy;
 pub mod subject;
 mod util;
 
@@ -23,4 +24,5 @@ pub use header::EntityHeader;
 pub use kind::EntityKind;
 pub use layer::{Layer, LayerGroup, Role, VariantList};
 pub use link::{Link, LinkTemporality, LinkType};
+pub use policy::{Effect, Policy, SubjectPredicate, TargetPredicate};
 pub use subject::{Credentials, Subject, SubjectKind};

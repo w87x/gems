@@ -9,6 +9,7 @@ members = [
     "crates/gems-bitmap",
     "crates/gems-query",
     "crates/gems-engine",
+    "crates/gems-abac",
 ]
 
 [workspace.package]

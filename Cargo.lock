@@ -19,6 +19,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-abac"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-codec",
+ "gems-common",
+]
+
+[[package]]
 name = "gems-bitmap"
 version = "0.1.0"
 

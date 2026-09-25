@@ -210,6 +210,27 @@ impl<'a> GbvReader<'a> {
     pub fn key_ids(&self) -> impl Iterator<Item = u32> + '_ {
         (0..self.field_count).map(move |i| self.entry_at(i).key_id)
     }
+
+    /// Rebuild this buffer with every field in `exclude` removed — the
+    /// ABAC PEP's field-level redaction obligation (ARCHITECTURE.md §8):
+    /// a `Permit` decision can still hide specific attributes from the
+    /// result rather than denying the whole entity. Fields not in
+    /// `exclude` keep their original bytes untouched.
+    pub fn redact(&self, exclude: &[u32]) -> Vec<u8> {
+        let mut builder = GbvBuilder::new();
+        for i in 0..self.field_count {
+            let entry = self.entry_at(i);
+            if exclude.contains(&entry.key_id) {
+                continue;
+            }
+            let start = self.values_start + entry.offset as usize;
+            let end = start + entry.len as usize;
+            if let Ok(tag) = TypeTag::from_u8(entry.type_tag) {
+                builder.push(entry.key_id, tag, &self.buf[start..end]);
+            }
+        }
+        builder.finish()
+    }
 }
 
 #[cfg(test)]
@@ -255,5 +276,36 @@ mod tests {
     #[test]
     fn rejects_truncated_buffer() {
         assert!(GbvReader::new(&[1]).is_err());
+    }
+
+    #[test]
+    fn redact_removes_only_the_named_fields() {
+        let mut b = GbvBuilder::new();
+        b.push(1, TypeTag::Str, b"visible");
+        b.push(2, TypeTag::Str, b"secret");
+        b.push(3, TypeTag::Int64, &7i64.to_le_bytes());
+        let buf = b.finish();
+
+        let r = GbvReader::new(&buf).unwrap();
+        let redacted = r.redact(&[2]);
+        let r2 = GbvReader::new(&redacted).unwrap();
+
+        assert_eq!(r2.field_count(), 2);
+        assert_eq!(r2.get(1).unwrap().1, b"visible");
+        assert!(r2.get(2).is_none());
+        assert_eq!(
+            i64::from_le_bytes(r2.get(3).unwrap().1.try_into().unwrap()),
+            7
+        );
+    }
+
+    #[test]
+    fn redact_with_no_matches_keeps_everything() {
+        let mut b = GbvBuilder::new();
+        b.push(1, TypeTag::Bool, &[1]);
+        let buf = b.finish();
+        let r = GbvReader::new(&buf).unwrap();
+        let redacted = r.redact(&[999]);
+        assert_eq!(GbvReader::new(&redacted).unwrap().field_count(), 1);
     }
 }
