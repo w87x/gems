@@ -98,6 +98,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-json"
+version = "0.1.0"
+
+[[package]]
+name = "gems-mcp"
+version = "0.1.0"
+dependencies = [
+ "gems-abac",
+ "gems-catalog",
+ "gems-codec",
+ "gems-common",
+ "gems-engine",
+ "gems-json",
+ "gems-query",
+]
+
+[[package]]
 name = "gems-query"
 version = "0.1.0"
 
@@ -117,6 +134,27 @@ dependencies = [
  "gems-cluster",
  "gems-codec",
  "gems-common",
+]
+
+[[package]]
+name = "gems-tui"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-common",
+ "gems-engine",
+ "rustix",
+]
+
+[[package]]
+name = "gems-webui"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-common",
+ "gems-engine",
+ "gems-json",
+ "gems-query",
 ]
 
 [[package]]

@@ -13,6 +13,10 @@ members = [
     "crates/gems-cli",
     "crates/gems-cluster",
     "crates/gems-subscribe",
+    "crates/gems-json",
+    "crates/gems-tui",
+    "crates/gems-webui",
+    "crates/gems-mcp",
 ]
 
 [workspace.package]

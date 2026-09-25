@@ -1,0 +1,22 @@
+[package]
+name = "gems-mcp"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gems-mcp"
+path = "src/main.rs"
+
+[lib]
+name = "gems_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+gems-common = { path = "../gems-common" }
+gems-catalog = { path = "../gems-catalog" }
+gems-engine = { path = "../gems-engine" }
+gems-query = { path = "../gems-query" }
+gems-json = { path = "../gems-json" }
+gems-abac = { path = "../gems-abac" }
+gems-codec = { path = "../gems-codec" }
