@@ -6,6 +6,7 @@ members = [
     "crates/gems-codec",
     "crates/gems-catalog",
     "crates/gems-index",
+    "crates/gems-bitmap",
 ]
 
 [workspace.package]
