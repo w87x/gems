@@ -582,6 +582,7 @@ impl RaftCore {
 /// caller is accumulating bytes off a socket.
 pub mod wire {
     use super::{Envelope, LogEntry, NodeId, Rpc, Term};
+    use crate::frame::check_frame_len;
     use crate::record::LogRecord;
     use gems_common::{Error, Result};
 
@@ -663,6 +664,7 @@ pub mod wire {
             return Ok(None);
         }
         let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        check_frame_len(payload_len, "Raft envelope exceeds the maximum frame size")?;
         let total_len = 4 + payload_len;
         if buf.len() < total_len {
             return Ok(None);
@@ -691,6 +693,17 @@ pub mod wire {
                 let prev_log_index = read_u64(payload, &mut pos)?;
                 let prev_log_term = read_term(payload, &mut pos)?;
                 let entry_count = read_u32(payload, &mut pos)? as usize;
+                // `entry_count` is attacker/corruption-controlled; each
+                // entry is at least 12 bytes (8-byte term + 4-byte
+                // LogRecord length prefix), so a claim bigger than what
+                // could possibly fit in the already-length-checked
+                // `payload` is rejected before `Vec::with_capacity` ever
+                // tries to allocate for it.
+                if entry_count > payload.len() / 12 {
+                    return Err(Error::InvalidValue {
+                        detail: "AppendEntries entry count exceeds what the payload could hold",
+                    });
+                }
                 let mut entries = Vec::with_capacity(entry_count);
                 for _ in 0..entry_count {
                     let entry_term = read_term(payload, &mut pos)?;
@@ -789,6 +802,34 @@ pub mod wire {
                     },
                 },
             ]
+        }
+
+        #[test]
+        fn decode_rejects_a_claimed_length_over_the_frame_cap() {
+            let mut buf = ((crate::frame::MAX_FRAME_LEN as u32) + 1)
+                .to_le_bytes()
+                .to_vec();
+            buf.push(1);
+            assert!(decode(&buf).is_err());
+        }
+
+        #[test]
+        fn decode_rejects_an_append_entries_count_bigger_than_the_payload_could_hold() {
+            // A crafted AppendEntries claiming e.g. a billion entries but
+            // with a payload far too small to actually hold them must be
+            // rejected before `Vec::with_capacity` ever sees that count.
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_le_bytes()); // from
+            payload.extend_from_slice(&2u32.to_le_bytes()); // to
+            payload.push(APPEND_ENTRIES_REQUEST);
+            payload.extend_from_slice(&1u64.to_le_bytes()); // term
+            payload.extend_from_slice(&1u32.to_le_bytes()); // leader_id
+            payload.extend_from_slice(&0u64.to_le_bytes()); // prev_log_index
+            payload.extend_from_slice(&0u64.to_le_bytes()); // prev_log_term
+            payload.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // entry_count
+            let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&payload);
+            assert!(decode(&framed).is_err());
         }
 
         #[test]

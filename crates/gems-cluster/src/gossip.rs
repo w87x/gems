@@ -426,6 +426,7 @@ impl SwimCore {
 /// real socket compose the same way everywhere in this workspace.
 pub mod wire {
     use super::{Envelope, GossipItem, Incarnation, NodeId, Status, SwimMessage};
+    use crate::frame::check_frame_len;
     use gems_common::{Error, Result};
 
     const PING: u8 = 1;
@@ -503,6 +504,7 @@ pub mod wire {
             return Ok(None);
         }
         let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        check_frame_len(payload_len, "SWIM envelope exceeds the maximum frame size")?;
         let total_len = 4 + payload_len;
         if buf.len() < total_len {
             return Ok(None);
@@ -542,6 +544,15 @@ pub mod wire {
         let seq = read_u32(buf, pos)?;
         let sender_incarnation = read_u64(buf, pos)?;
         let count = read_u32(buf, pos)? as usize;
+        // Each gossip item is at least 13 bytes (4-byte node id + 1-byte
+        // status + 8-byte incarnation); reject a claimed count bigger than
+        // what could fit in the remainder of `buf` before trusting it to
+        // size a `Vec::with_capacity` allocation.
+        if count > buf.len().saturating_sub(*pos) / 13 {
+            return Err(Error::InvalidValue {
+                detail: "SWIM gossip item count exceeds what the payload could hold",
+            });
+        }
         let mut gossip = Vec::with_capacity(count);
         for _ in 0..count {
             let member = read_node_id(buf, pos)?;
@@ -593,6 +604,29 @@ pub mod wire {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn decode_rejects_a_claimed_length_over_the_frame_cap() {
+            let mut buf = ((crate::frame::MAX_FRAME_LEN as u32) + 1)
+                .to_le_bytes()
+                .to_vec();
+            buf.push(1);
+            assert!(decode(&buf).is_err());
+        }
+
+        #[test]
+        fn decode_rejects_a_gossip_count_bigger_than_the_payload_could_hold() {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_le_bytes()); // from
+            payload.extend_from_slice(&2u32.to_le_bytes()); // to
+            payload.push(PING);
+            payload.extend_from_slice(&1u32.to_le_bytes()); // seq
+            payload.extend_from_slice(&1u64.to_le_bytes()); // sender_incarnation
+            payload.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // gossip count
+            let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&payload);
+            assert!(decode(&framed).is_err());
+        }
 
         #[test]
         fn ping_roundtrip_with_gossip_items() {

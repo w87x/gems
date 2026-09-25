@@ -22,6 +22,8 @@ use gems_catalog::EntityHeader;
 use gems_common::tuid::TUID_LEN;
 use gems_common::{Error, Result, Tuid};
 
+use crate::frame::check_frame_len;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LogRecord {
     Insert { header: EntityHeader, body: Vec<u8> },
@@ -64,6 +66,10 @@ impl LogRecord {
             return Ok(None);
         }
         let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        check_frame_len(
+            payload_len,
+            "log record payload exceeds the maximum frame size",
+        )?;
         let total_len = 4 + payload_len;
         if buf.len() < total_len {
             return Ok(None);
@@ -159,6 +165,20 @@ mod tests {
         let (decoded, consumed) = LogRecord::decode(&encoded).unwrap().unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn decode_rejects_a_claimed_length_over_the_frame_cap_without_waiting_for_the_data() {
+        // A hostile or corrupted length prefix claiming a huge payload
+        // must error out immediately, from just the 4-byte prefix, rather
+        // than returning `Ok(None)` and waiting for a reader loop to
+        // accumulate that many bytes (the actual memory-exhaustion risk
+        // this cap defends against).
+        let mut buf = ((crate::frame::MAX_FRAME_LEN as u32) + 1)
+            .to_le_bytes()
+            .to_vec();
+        buf.push(1); // one byte of "payload" — nowhere near the claimed length
+        assert!(LogRecord::decode(&buf).is_err());
     }
 
     #[test]

@@ -33,6 +33,7 @@
 //!   from Raft's job of getting a specific shard's replicas to agree on
 //!   its log.
 
+mod frame;
 pub mod gossip;
 mod log;
 mod primary;

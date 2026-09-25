@@ -7,8 +7,20 @@
 //! this exact case: "admin-tool traffic levels don't need an async
 //! runtime."
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
+use std::time::Duration;
+
+/// Caps on a single connection's request-line/header parsing, so a slow or
+/// hostile client can't hold a server thread (and unbounded memory) by
+/// trickling an arbitrarily long line or an endless stream of headers that
+/// never reaches the terminating blank line. `std::io::BufRead::read_line`
+/// has no length limit of its own — without `MAX_LINE_LEN`, a client that
+/// never sends `\n` makes that call buffer the connection's entire input
+/// before returning.
+const MAX_LINE_LEN: u64 = 8 * 1024;
+const MAX_HEADER_LINES: usize = 200;
+const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Request {
     pub method: String,
@@ -25,12 +37,26 @@ impl Request {
     }
 }
 
-pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
-    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
+/// Reads one line (including its trailing `\n`, if any) from `reader`,
+/// refusing to buffer more than `MAX_LINE_LEN` bytes while looking for it.
+fn read_line_capped(reader: &mut impl BufRead) -> Result<String, String> {
+    let mut buf = Vec::new();
+    let mut limited = reader.take(MAX_LINE_LEN);
+    limited
+        .read_until(b'\n', &mut buf)
         .map_err(|e| e.to_string())?;
+    if buf.len() as u64 >= MAX_LINE_LEN && !buf.ends_with(b"\n") {
+        return Err("line exceeds the maximum allowed length".to_string());
+    }
+    String::from_utf8(buf).map_err(|e| e.to_string())
+}
+
+pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
+    stream
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
+    let request_line = read_line_capped(&mut reader)?;
     if request_line.is_empty() {
         return Err("empty request".to_string());
     }
@@ -40,13 +66,12 @@ pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
     let target = parts.next().ok_or("missing request target")?.to_string();
 
     // Drain (and ignore) headers up to the blank line — no header this
-    // crate's routes need to read.
-    loop {
-        let mut header_line = String::new();
-        let n = reader
-            .read_line(&mut header_line)
-            .map_err(|e| e.to_string())?;
-        if n == 0 || header_line.trim().is_empty() {
+    // crate's routes need to read. Bounded in both line length and line
+    // count so a client can't hold the connection open indefinitely by
+    // never sending the terminating blank line.
+    for _ in 0..MAX_HEADER_LINES {
+        let header_line = read_line_capped(&mut reader)?;
+        if header_line.is_empty() || header_line.trim().is_empty() {
             break;
         }
     }
@@ -155,5 +180,65 @@ mod tests {
     #[test]
     fn parse_query_string_empty_is_empty() {
         assert!(parse_query_string("").is_empty());
+    }
+
+    #[test]
+    fn parse_request_rejects_a_request_line_over_the_length_cap() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            // A request line far longer than MAX_LINE_LEN, no newline —
+            // simulates a client that never terminates the line. Without
+            // the cap, parse_request's read_line would buffer this
+            // (and keep waiting for more) indefinitely.
+            let oversized = vec![b'A'; (MAX_LINE_LEN as usize) * 2];
+            let _ = client.write_all(b"GET /");
+            let _ = client.write_all(&oversized);
+            // Let the connection drop; server side should already have
+            // errored out on the length cap before this.
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        let result = parse_request(&stream);
+        assert!(
+            result.is_err(),
+            "an unterminated over-long line must be rejected"
+        );
+
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn parse_request_rejects_too_many_header_lines() {
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let writer = thread::spawn(move || {
+            let mut client = TcpStream::connect(addr).unwrap();
+            let _ = client.write_all(b"GET / HTTP/1.1\r\n");
+            // More headers than MAX_HEADER_LINES, never reaching a blank
+            // line — a client trying to hold the connection open forever.
+            for i in 0..(MAX_HEADER_LINES * 2) {
+                let _ = client.write_all(format!("X-Pad-{i}: v\r\n").as_bytes());
+            }
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        // With the header count bounded, parse_request must return
+        // (successfully, treating the loop's exhaustion as "no more
+        // headers to read") rather than looping forever waiting for a
+        // blank line that never comes.
+        let result = parse_request(&stream);
+        assert!(result.is_ok());
+
+        writer.join().unwrap();
     }
 }
