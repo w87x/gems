@@ -21,12 +21,20 @@
 #   docker compose logs -f shard0-node1  # watch one node's status/log lines
 #   docker compose run --rm client propose --name widget-1 --status active
 #   docker compose exec shard0-node1 gems query /data "SELECT * FROM entities"
-#   open http://localhost:8080           # browse data via the webui frontend
+#   docker compose run --rm client install --admin-name admin
+#                                         # one-time: seeds the admin/analyst/
+#                                         # consumer roles, a starter policy
+#                                         # set, and prints an admin token
+#   open http://localhost:8080           # the webui frontend
 #     - Store directory: /stores/shard0 (or /stores/shard1)
-#     - Access token: leave blank — the webui service runs with --insecure
-#       for local testing (see its service definition below); a real
-#       deployment should drop --insecure and set GEMS_WEBUI_SECRET instead
+#     - Access token: the admin token `install` printed (or use the
+#       Setup workspace tab in the browser instead of the CLI step above)
 #   docker compose down -v               # stop and wipe all store data
+
+# A throwaway default — replace for anything beyond local testing (this is
+# the HMAC secret gems-webui verifies Authorization: Bearer tokens against,
+# separate from the cluster's own inter-node secret below).
+x-webui-secret: &webui-secret "local-testing-webui-secret-change-me"
 
 x-shard-map: &shard-map |-
   {"shards":[
@@ -120,16 +128,24 @@ services:
     entrypoint: [gems-cluster-node]
     environment:
       GEMS_SHARD_MAP: *shard-map
+      GEMS_WEBUI_SECRET: *webui-secret
 
-  # The browser query frontend (ARCHITECTURE.md §9). Reads each shard's
-  # data directly off its node-1 volume (read-only — this service never
-  # writes, so it never needs the store's directory lock). --insecure
-  # disables the Authorization: Bearer requirement, since this compose
-  # file is for local testing, not a real deployment.
+  # The browser admin UI (ARCHITECTURE.md §9): query/browse, plus full
+  # entity/type/subject/policy CRUD across three workspaces. Reads each
+  # shard's data directly off its node-1 volume (read-only — this service
+  # never opens a store writable; every write instead goes through the
+  # cluster's own Raft `propose` path via $GEMS_SHARD_MAP, exactly like
+  # `gems-cluster-node propose`/`install` — see write_api.rs's module doc
+  # for why). Runs with $GEMS_WEBUI_SECRET set (not --insecure), so its
+  # role-gated write routes are actually meaningful to test; use the
+  # Setup workspace tab or `client install` above to get an admin token.
   webui:
     build: .
     entrypoint: [gems-webui]
-    command: ["--insecure", "0.0.0.0:8080"]
+    command: ["0.0.0.0:8080"]
+    environment:
+      GEMS_SHARD_MAP: *shard-map
+      GEMS_WEBUI_SECRET: *webui-secret
     ports: ["8080:8080"]
     volumes:
       - shard0-node1-data:/stores/shard0:ro

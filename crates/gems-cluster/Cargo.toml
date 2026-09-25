@@ -10,6 +10,7 @@ path = "src/bin/node.rs"
 
 [dependencies]
 rustix.workspace = true
+gems-abac = { path = "../gems-abac" }
 gems-common = { path = "../gems-common" }
 gems-catalog = { path = "../gems-catalog" }
 gems-codec = { path = "../gems-codec" }

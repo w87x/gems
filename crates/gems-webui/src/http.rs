@@ -1,11 +1,10 @@
 //! A minimal HTTP/1.1 server: just enough request parsing and response
 //! writing for a small JSON API plus a couple of static assets. No
-//! keep-alive, no chunked transfer, no request bodies (every API route in
-//! this crate is `GET` with query-string parameters — see `main.rs`'s
-//! module doc for why that's the deliberate v1 scope). Blocking I/O,
-//! thread-per-connection, consistent with ARCHITECTURE.md §9's take on
-//! this exact case: "admin-tool traffic levels don't need an async
-//! runtime."
+//! keep-alive, no chunked transfer (a request body must carry
+//! `Content-Length`; a chunked or unbounded body is rejected rather than
+//! read indefinitely). Blocking I/O, thread-per-connection, consistent
+//! with ARCHITECTURE.md §9's take on this exact case: "admin-tool traffic
+//! levels don't need an async runtime."
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -21,6 +20,12 @@ use std::time::Duration;
 const MAX_LINE_LEN: u64 = 8 * 1024;
 const MAX_HEADER_LINES: usize = 200;
 const DEFAULT_READ_TIMEOUT_SECS: u64 = 10;
+
+/// A request body cap: generous enough for any JSON payload this API's
+/// write routes send (an entity's fields, a policy, a subject), small
+/// enough that a client can't make a server thread buffer an unbounded
+/// amount of memory via `Content-Length`.
+const MAX_BODY_LEN: u64 = 1024 * 1024;
 
 /// The read timeout is the one operator-tunable knob here — a slower
 /// network path (a reverse proxy adding latency, a high-RTT client) might
@@ -49,6 +54,7 @@ pub struct Request {
     pub path: String,
     pub query: Vec<(String, String)>,
     pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
 impl Request {
@@ -72,6 +78,13 @@ impl Request {
     /// present and correctly formed.
     pub fn bearer_token(&self) -> Option<&str> {
         self.header("Authorization")?.strip_prefix("Bearer ")
+    }
+
+    /// Parses the request body as JSON. Every write route needs this, so
+    /// it lives here rather than being repeated per handler.
+    pub fn json_body(&self) -> Result<gems_json::Value, String> {
+        let text = std::str::from_utf8(&self.body).map_err(|e| e.to_string())?;
+        gems_json::parse(text).map_err(|e| e.to_string())
     }
 }
 
@@ -124,11 +137,30 @@ pub fn parse_request(stream: &TcpStream) -> Result<Request, String> {
     };
     let query = parse_query_string(&query_string);
 
+    let body = match headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+    {
+        Some((_, v)) => {
+            let len: u64 = v
+                .parse()
+                .map_err(|_| "invalid Content-Length".to_string())?;
+            if len > MAX_BODY_LEN {
+                return Err("request body exceeds the maximum allowed length".to_string());
+            }
+            let mut buf = vec![0u8; len as usize];
+            reader.read_exact(&mut buf).map_err(|e| e.to_string())?;
+            buf
+        }
+        None => Vec::new(),
+    };
+
     Ok(Request {
         method,
         path,
         query,
         headers,
+        body,
     })
 }
 

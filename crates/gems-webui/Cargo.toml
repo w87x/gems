@@ -16,3 +16,4 @@ gems-query = { path = "../gems-query" }
 gems-json = { path = "../gems-json" }
 gems-abac = { path = "../gems-abac" }
 gems-codec = { path = "../gems-codec" }
+gems-cluster = { path = "../gems-cluster" }

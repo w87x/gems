@@ -6,6 +6,7 @@
 //! validated against an `EntityType` by the layer that owns write paths
 //! (not this crate, which only defines the shapes).
 
+pub mod bootstrap;
 pub mod entity_attribute;
 pub mod entity_type;
 pub mod flags;

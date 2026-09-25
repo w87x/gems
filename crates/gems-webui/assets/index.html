@@ -11,6 +11,8 @@
     --text: #e6e8ec;
     --muted: #9aa1ac;
     --accent: #5b8cff;
+    --danger: #ff6b6b;
+    --ok: #4ade80;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -25,29 +27,50 @@
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 16px;
+    flex-wrap: wrap;
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .conn { display: flex; gap: 8px; align-items: center; flex: 1; min-width: 320px; }
+  header .conn input { width: auto; flex: 1; min-width: 120px; margin: 0; }
   header .status { color: var(--muted); font-size: 12px; }
-  main {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 1px;
-    background: var(--border);
-    height: calc(100vh - 49px);
+  nav.workspaces {
+    display: flex;
+    gap: 2px;
+    border-bottom: 1px solid var(--border);
+    padding: 0 16px;
   }
-  section {
-    background: var(--bg);
-    padding: 16px;
-    overflow: auto;
+  nav.workspaces button {
+    margin: 0;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--muted);
+    padding: 10px 14px;
+    border-radius: 0;
+    font-size: 13px;
   }
-  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-  input, textarea {
-    width: 100%;
+  nav.workspaces button.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { padding: 16px; }
+  .workspace { display: none; }
+  .workspace.active { display: block; }
+  .columns { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .panel {
     background: var(--panel);
     border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 13px; margin: 0 0 10px; font-weight: 600; color: var(--text); }
+  .panel h3 { font-size: 12px; margin: 14px 0 6px; color: var(--muted); font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, textarea, select {
+    width: 100%;
+    background: #0f1115;
+    border: 1px solid var(--border);
     color: var(--text);
-    padding: 8px;
+    padding: 7px 8px;
     border-radius: 4px;
     font-family: var(--mono);
     font-size: 13px;
@@ -58,57 +81,208 @@
     background: var(--accent);
     color: white;
     border: none;
-    padding: 8px 14px;
+    padding: 7px 14px;
     border-radius: 4px;
     cursor: pointer;
     font-size: 13px;
   }
-  button.secondary { background: var(--panel); border: 1px solid var(--border); color: var(--text); }
-  table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 13px; }
-  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+  button.secondary { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+  button.small { padding: 3px 8px; margin: 0; font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
   th { color: var(--muted); font-weight: 500; }
   tr.row { cursor: pointer; }
-  tr.row:hover { background: var(--panel); }
+  tr.row:hover { background: #1d212b; }
   .id { font-family: var(--mono); color: var(--muted); font-size: 12px; }
-  .error { color: #ff6b6b; margin-top: 10px; }
-  pre { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 10px; overflow: auto; font-family: var(--mono); font-size: 12px; }
-  .field { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px solid var(--border); }
-  .field .k { color: var(--muted); }
+  .error { color: var(--danger); margin-top: 10px; white-space: pre-wrap; }
+  .ok-msg { color: var(--ok); margin-top: 10px; white-space: pre-wrap; }
+  pre { background: #0f1115; border: 1px solid var(--border); border-radius: 4px; padding: 10px; overflow: auto; font-family: var(--mono); font-size: 12px; }
+  .field-row { display: flex; gap: 6px; margin-top: 6px; }
+  .field-row input { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .token-box { word-break: break-all; }
 </style>
 </head>
 <body>
 <header>
   <h1>gems</h1>
+  <div class="conn">
+    <input id="store_dir" placeholder="store directory, e.g. /stores/shard0">
+    <input id="token" placeholder="access token" type="password">
+  </div>
   <span class="status" id="status"></span>
 </header>
+
+<nav class="workspaces">
+  <button data-ws="setup" class="active">Setup</button>
+  <button data-ws="browse">Browse &amp; Query</button>
+  <button data-ws="data">Data</button>
+  <button data-ws="admin">Admin</button>
+</nav>
+
 <main>
-  <section id="query-panel">
-    <label for="store_dir">Store directory</label>
-    <input id="store_dir" placeholder="/path/to/store">
 
-    <label for="token">Access token</label>
-    <input id="token" placeholder="Bearer token from gems-abac::token::issue" type="password">
-    <div class="status">Sent as an Authorization: Bearer header. The subject/roles it verifies to are what ABAC enforces reads against — the server no longer trusts a plain subject id typed here.</div>
-
-    <label for="query">Query</label>
-    <textarea id="query">SELECT * FROM entities</textarea>
-
+<!-- ===================== Setup ===================== -->
+<section class="workspace active" id="ws-setup">
+  <div class="panel">
+    <h2>First-run setup</h2>
+    <div class="hint">
+      Seeds the <code>admin</code>/<code>analyst</code>/<code>consumer</code> roles, a starter
+      policy set, and one admin user, then mints that user's access token. Run this once per
+      cluster (also available as <code>gems-cluster-node install</code> from the command line).
+      Requires this server's <code>$GEMS_WEBUI_SECRET</code> — proving you already have some
+      other way into the deployment, not just network access to it.
+    </div>
+    <label for="setup-admin-name">Admin name</label>
+    <input id="setup-admin-name" value="admin">
+    <label for="setup-secret">Setup secret ($GEMS_WEBUI_SECRET)</label>
+    <input id="setup-secret" type="password">
     <div>
-      <button id="run-query">Run query</button>
-      <button class="secondary" id="list-types">List entity types</button>
+      <button id="run-setup">Run setup</button>
+    </div>
+    <div class="error" id="setup-error"></div>
+    <div class="ok-msg" id="setup-ok" hidden>
+      Admin token minted — copied into the Access token field above.
+      <div class="token-box" id="setup-token"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== Browse & Query ===================== -->
+<section class="workspace" id="ws-browse">
+  <div class="columns">
+    <div class="panel">
+      <h2>Query</h2>
+      <label for="query">Query</label>
+      <textarea id="query">SELECT * FROM entities</textarea>
+      <div>
+        <button id="run-query">Run query</button>
+        <button class="secondary" id="list-types-browse">List entity types</button>
+      </div>
+      <div class="error" id="query-error"></div>
+      <table id="browse-results" hidden>
+        <thead><tr><th>Name</th><th>Kind</th><th>Id</th></tr></thead>
+        <tbody id="browse-results-body"></tbody>
+      </table>
+    </div>
+    <div class="panel">
+      <h2>Detail</h2>
+      <div class="hint" id="detail-placeholder">Select a row to see entity detail.</div>
+      <div id="detail" hidden></div>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== Data (analyst) ===================== -->
+<section class="workspace" id="ws-data">
+  <div class="columns">
+    <div class="panel">
+      <h2>New entity</h2>
+      <label for="entity-type">Type</label>
+      <select id="entity-type"></select>
+      <label for="entity-name">Name</label>
+      <input id="entity-name">
+      <h3>Fields</h3>
+      <div id="entity-fields"></div>
+      <button class="secondary small" id="add-field">+ field</button>
+      <div>
+        <button id="save-entity">Create entity</button>
+      </div>
+      <div class="error" id="entity-error"></div>
+      <div class="ok-msg" id="entity-ok" hidden></div>
+    </div>
+    <div class="panel">
+      <h2>Entities</h2>
+      <div>
+        <button class="secondary" id="refresh-entities">Refresh (SELECT * FROM entities)</button>
+      </div>
+      <table id="data-results" hidden>
+        <thead><tr><th>Name</th><th>Id</th><th></th></tr></thead>
+        <tbody id="data-results-body"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ===================== Admin ===================== -->
+<section class="workspace" id="ws-admin">
+  <div class="columns">
+    <div class="panel">
+      <h2>Entity types</h2>
+      <label for="type-name">New type name</label>
+      <input id="type-name">
+      <button id="save-type">Create type</button>
+      <div class="error" id="type-error"></div>
+      <table id="admin-types" hidden>
+        <thead><tr><th>Name</th><th>Id</th><th></th></tr></thead>
+        <tbody id="admin-types-body"></tbody>
+      </table>
     </div>
 
-    <div class="error" id="query-error"></div>
-    <table id="results" hidden>
-      <thead><tr><th>Name</th><th>Kind</th><th>Id</th></tr></thead>
-      <tbody id="results-body"></tbody>
-    </table>
-  </section>
+    <div class="panel">
+      <h2>Roles</h2>
+      <div class="hint">Seeded by setup; reference these names/ids when creating policies or issuing tokens.</div>
+      <table id="admin-roles" hidden>
+        <thead><tr><th>Name</th><th>Id</th></tr></thead>
+        <tbody id="admin-roles-body"></tbody>
+      </table>
+    </div>
 
-  <section id="detail-panel">
-    <div class="status" id="detail-placeholder">Select a row to see entity detail.</div>
-    <div id="detail" hidden></div>
-  </section>
+    <div class="panel">
+      <h2>Subjects (users)</h2>
+      <label for="subject-name">New subject name</label>
+      <input id="subject-name">
+      <button id="save-subject">Create subject</button>
+      <div class="error" id="subject-error"></div>
+      <table id="admin-subjects" hidden>
+        <thead><tr><th>Name</th><th>Id</th><th></th></tr></thead>
+        <tbody id="admin-subjects-body"></tbody>
+      </table>
+      <div id="issue-token-panel" hidden>
+        <h3>Issue token for <span id="issue-token-subject-name"></span></h3>
+        <div class="hint">Comma-separated role names, e.g. <code>analyst</code> or <code>admin,analyst</code>.</div>
+        <input id="issue-token-roles" placeholder="analyst">
+        <button id="issue-token-go" class="small">Issue token</button>
+        <div class="error" id="issue-token-error"></div>
+        <div class="token-box" id="issue-token-result"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Policies</h2>
+      <label for="policy-effect">Effect</label>
+      <select id="policy-effect">
+        <option value="permit">permit</option>
+        <option value="deny">deny</option>
+      </select>
+      <label for="policy-target-kind">Target kind (blank = any)</label>
+      <select id="policy-target-kind">
+        <option value="">any</option>
+        <option value="Data">Data</option>
+        <option value="EntityType">EntityType</option>
+        <option value="Subject">Subject</option>
+        <option value="Role">Role</option>
+        <option value="Policy">Policy</option>
+      </select>
+      <label for="policy-target-type">Target type id (blank = any, Data only)</label>
+      <input id="policy-target-type" placeholder="entity type id hex">
+      <label for="policy-role-name">Role name (blank = any subject)</label>
+      <input id="policy-role-name" placeholder="e.g. analyst">
+      <label for="policy-subject-id">Specific subject id (blank = any)</label>
+      <input id="policy-subject-id">
+      <label for="policy-redact">Redact fields (comma-separated, permit only)</label>
+      <input id="policy-redact">
+      <button id="save-policy">Create policy</button>
+      <div class="error" id="policy-error"></div>
+      <table id="admin-policies" hidden>
+        <thead><tr><th>Id</th><th></th></tr></thead>
+        <tbody id="admin-policies-body"></tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
 </main>
 
 <script>
@@ -117,7 +291,25 @@ const $ = (id) => document.getElementById(id);
 function storeDir() { return $('store_dir').value.trim(); }
 function token() { return $('token').value.trim(); }
 
-async function api(path, params) {
+// Per-viewer convenience only (which store/token were last used) — never
+// relied on for anything security-sensitive, and wrapped since a private
+// window or blocked storage must not break the page.
+function restoreConnection() {
+  try {
+    const dir = localStorage.getItem('gems.store_dir');
+    const tok = localStorage.getItem('gems.token');
+    if (dir) $('store_dir').value = dir;
+    if (tok) $('token').value = tok;
+  } catch (e) { /* ignore */ }
+}
+function saveConnection() {
+  try {
+    localStorage.setItem('gems.store_dir', storeDir());
+    localStorage.setItem('gems.token', token());
+  } catch (e) { /* ignore */ }
+}
+
+async function apiGet(path, params) {
   const url = new URL(path, window.location.origin);
   for (const [k, v] of Object.entries(params)) {
     if (v) url.searchParams.set(k, v);
@@ -128,47 +320,94 @@ async function api(path, params) {
   return res.json();
 }
 
-function renderResults(entities) {
-  const body = $('results-body');
-  body.innerHTML = '';
-  for (const e of entities) {
-    const tr = document.createElement('tr');
-    tr.className = 'row';
-    tr.innerHTML = `<td>${escapeHtml(e.name)}</td><td>${escapeHtml(e.kind)}</td><td class="id">${e.id.slice(0, 12)}…</td>`;
-    tr.addEventListener('click', () => loadDetail(e.id));
-    body.appendChild(tr);
+async function apiPost(path, params, body) {
+  const url = new URL(path, window.location.origin);
+  for (const [k, v] of Object.entries(params || {})) {
+    if (v) url.searchParams.set(k, v);
   }
-  $('results').hidden = entities.length === 0;
+  const headers = { 'Content-Type': 'application/json' };
+  if (token()) headers['Authorization'] = 'Bearer ' + token();
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body || {}) });
+  return res.json();
 }
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-async function runQuery() {
-  $('query-error').textContent = '';
-  const result = await api('/api/query', { store_dir: storeDir(), q: $('query').value });
-  if (!result.ok) {
-    $('query-error').textContent = result.error;
-    $('results').hidden = true;
-    return;
-  }
-  renderResults(result.data);
+function shortId(id) { return id.slice(0, 12) + '…'; }
+
+// ------------------------------------------------------------------
+// Workspace tabs
+// ------------------------------------------------------------------
+
+function showWorkspace(name) {
+  document.querySelectorAll('.workspace').forEach((el) => el.classList.remove('active'));
+  document.querySelectorAll('nav.workspaces button').forEach((el) => el.classList.remove('active'));
+  $('ws-' + name).classList.add('active');
+  document.querySelector(`nav.workspaces button[data-ws="${name}"]`).classList.add('active');
+  if (name === 'data') { populateEntityTypeOptions(); }
+  if (name === 'admin') { loadTypes(); loadRoles(); loadSubjects(); loadPolicies(); }
 }
 
-async function listTypes() {
-  $('query-error').textContent = '';
-  const result = await api('/api/types', { store_dir: storeDir() });
+document.querySelectorAll('nav.workspaces button').forEach((btn) => {
+  btn.addEventListener('click', () => showWorkspace(btn.dataset.ws));
+});
+
+// ------------------------------------------------------------------
+// Setup
+// ------------------------------------------------------------------
+
+$('run-setup').addEventListener('click', async () => {
+  $('setup-error').textContent = '';
+  $('setup-ok').hidden = true;
+  const result = await apiPost('/api/setup', { store_dir: storeDir() }, {
+    admin_name: $('setup-admin-name').value.trim() || 'admin',
+    setup_secret: $('setup-secret').value,
+  });
   if (!result.ok) {
-    $('query-error').textContent = result.error;
-    $('results').hidden = true;
+    $('setup-error').textContent = result.error;
     return;
   }
-  renderResults(result.data);
+  $('token').value = result.data.admin_token;
+  saveConnection();
+  $('setup-token').textContent = result.data.admin_token;
+  $('setup-ok').hidden = false;
+});
+
+// ------------------------------------------------------------------
+// Browse & Query
+// ------------------------------------------------------------------
+
+function renderBrowseResults(entities) {
+  const body = $('browse-results-body');
+  body.innerHTML = '';
+  for (const e of entities) {
+    const tr = document.createElement('tr');
+    tr.className = 'row';
+    tr.innerHTML = `<td>${escapeHtml(e.name)}</td><td>${escapeHtml(e.kind)}</td><td class="id">${shortId(e.id)}</td>`;
+    tr.addEventListener('click', () => loadDetail(e.id));
+    body.appendChild(tr);
+  }
+  $('browse-results').hidden = entities.length === 0;
 }
+
+$('run-query').addEventListener('click', async () => {
+  $('query-error').textContent = '';
+  const result = await apiGet('/api/query', { store_dir: storeDir(), q: $('query').value });
+  if (!result.ok) { $('query-error').textContent = result.error; $('browse-results').hidden = true; return; }
+  renderBrowseResults(result.data);
+});
+
+$('list-types-browse').addEventListener('click', async () => {
+  $('query-error').textContent = '';
+  const result = await apiGet('/api/types', { store_dir: storeDir() });
+  if (!result.ok) { $('query-error').textContent = result.error; $('browse-results').hidden = true; return; }
+  renderBrowseResults(result.data);
+});
 
 async function loadDetail(id) {
-  const result = await api('/api/entity', { store_dir: storeDir(), id });
+  const result = await apiGet('/api/entity', { store_dir: storeDir(), id });
   const detail = $('detail');
   $('detail-placeholder').hidden = true;
   detail.hidden = false;
@@ -179,7 +418,7 @@ async function loadDetail(id) {
   const e = result.data;
   let html = '';
   for (const [k, v] of [['id', e.id], ['name', e.name], ['description', e.description], ['kind', e.kind], ['schema_ref', e.schema_ref]]) {
-    html += `<div class="field"><span class="k">${k}</span><span>${escapeHtml(v || '')}</span></div>`;
+    html += `<div><span class="hint">${k}:</span> ${escapeHtml(v || '')}</div>`;
   }
   if (e.fields) {
     html += '<h3>Fields</h3><pre>' + escapeHtml(JSON.stringify(e.fields, null, 2)) + '</pre>';
@@ -187,8 +426,232 @@ async function loadDetail(id) {
   detail.innerHTML = html;
 }
 
-$('run-query').addEventListener('click', runQuery);
-$('list-types').addEventListener('click', listTypes);
+// ------------------------------------------------------------------
+// Data workspace (create/delete entities)
+// ------------------------------------------------------------------
+
+async function populateEntityTypeOptions() {
+  const result = await apiGet('/api/types', { store_dir: storeDir() });
+  const select = $('entity-type');
+  select.innerHTML = '';
+  if (!result.ok) return;
+  for (const t of result.data) {
+    const opt = document.createElement('option');
+    opt.value = t.id;
+    opt.textContent = t.name;
+    select.appendChild(opt);
+  }
+}
+
+function addFieldRow(key, value) {
+  const row = document.createElement('div');
+  row.className = 'field-row';
+  row.innerHTML = `<input class="field-key" placeholder="field name" value="${escapeHtml(key || '')}">
+                    <input class="field-value" placeholder="value" value="${escapeHtml(value || '')}">
+                    <button class="secondary small remove-field" type="button">×</button>`;
+  row.querySelector('.remove-field').addEventListener('click', () => row.remove());
+  $('entity-fields').appendChild(row);
+}
+$('add-field').addEventListener('click', () => addFieldRow());
+addFieldRow('status', '');
+
+$('save-entity').addEventListener('click', async () => {
+  $('entity-error').textContent = '';
+  $('entity-ok').hidden = true;
+  const fields = {};
+  document.querySelectorAll('#entity-fields .field-row').forEach((row) => {
+    const key = row.querySelector('.field-key').value.trim();
+    const value = row.querySelector('.field-value').value;
+    if (key) fields[key] = value;
+  });
+  const result = await apiPost('/api/entities/save', { store_dir: storeDir() }, {
+    type: $('entity-type').value,
+    name: $('entity-name').value.trim(),
+    fields,
+  });
+  if (!result.ok) { $('entity-error').textContent = result.error; return; }
+  $('entity-ok').textContent = 'created: ' + result.data.id;
+  $('entity-ok').hidden = false;
+  refreshDataEntities();
+});
+
+function renderDataResults(entities) {
+  const body = $('data-results-body');
+  body.innerHTML = '';
+  for (const e of entities) {
+    const tr = document.createElement('tr');
+    const actionsTd = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger small';
+    del.textContent = 'delete';
+    del.addEventListener('click', async () => {
+      const result = await apiPost('/api/entities/delete', { store_dir: storeDir() }, { id: e.id });
+      if (!result.ok) { $('entity-error').textContent = result.error; return; }
+      refreshDataEntities();
+    });
+    actionsTd.appendChild(del);
+    tr.innerHTML = `<td>${escapeHtml(e.name)}</td><td class="id">${shortId(e.id)}</td>`;
+    tr.appendChild(actionsTd);
+    body.appendChild(tr);
+  }
+  $('data-results').hidden = entities.length === 0;
+}
+
+async function refreshDataEntities() {
+  const result = await apiGet('/api/query', { store_dir: storeDir(), q: 'SELECT * FROM entities' });
+  if (!result.ok) { $('entity-error').textContent = result.error; return; }
+  renderDataResults(result.data.filter((e) => e.kind === 'Data'));
+}
+$('refresh-entities').addEventListener('click', refreshDataEntities);
+
+// ------------------------------------------------------------------
+// Admin workspace
+// ------------------------------------------------------------------
+
+async function loadTypes() {
+  const result = await apiGet('/api/types', { store_dir: storeDir() });
+  const body = $('admin-types-body');
+  body.innerHTML = '';
+  if (!result.ok) { $('type-error').textContent = result.error; return; }
+  $('type-error').textContent = '';
+  for (const t of result.data) {
+    const tr = document.createElement('tr');
+    const actionsTd = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger small';
+    del.textContent = 'delete';
+    del.addEventListener('click', async () => {
+      const r = await apiPost('/api/types/delete', { store_dir: storeDir() }, { id: t.id });
+      if (!r.ok) { $('type-error').textContent = r.error; return; }
+      loadTypes();
+    });
+    actionsTd.appendChild(del);
+    tr.innerHTML = `<td>${escapeHtml(t.name)}</td><td class="id">${shortId(t.id)}</td>`;
+    tr.appendChild(actionsTd);
+    body.appendChild(tr);
+  }
+  $('admin-types').hidden = result.data.length === 0;
+}
+
+$('save-type').addEventListener('click', async () => {
+  $('type-error').textContent = '';
+  const result = await apiPost('/api/types/save', { store_dir: storeDir() }, {
+    name: $('type-name').value.trim(),
+  });
+  if (!result.ok) { $('type-error').textContent = result.error; return; }
+  $('type-name').value = '';
+  loadTypes();
+});
+
+async function loadRoles() {
+  const result = await apiGet('/api/roles', { store_dir: storeDir() });
+  const body = $('admin-roles-body');
+  body.innerHTML = '';
+  if (!result.ok) { return; }
+  for (const r of result.data) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${escapeHtml(r.name)}</td><td class="id">${r.id}</td>`;
+    body.appendChild(tr);
+  }
+  $('admin-roles').hidden = result.data.length === 0;
+}
+
+let selectedSubject = null;
+
+async function loadSubjects() {
+  const result = await apiGet('/api/subjects', { store_dir: storeDir() });
+  const body = $('admin-subjects-body');
+  body.innerHTML = '';
+  if (!result.ok) { $('subject-error').textContent = result.error; return; }
+  $('subject-error').textContent = '';
+  for (const s of result.data) {
+    const tr = document.createElement('tr');
+    const actionsTd = document.createElement('td');
+    const issue = document.createElement('button');
+    issue.className = 'secondary small';
+    issue.textContent = 'issue token';
+    issue.addEventListener('click', () => {
+      selectedSubject = s;
+      $('issue-token-subject-name').textContent = s.name;
+      $('issue-token-panel').hidden = false;
+      $('issue-token-error').textContent = '';
+      $('issue-token-result').textContent = '';
+    });
+    actionsTd.appendChild(issue);
+    tr.innerHTML = `<td>${escapeHtml(s.name)}</td><td class="id">${shortId(s.id)}</td>`;
+    tr.appendChild(actionsTd);
+    body.appendChild(tr);
+  }
+  $('admin-subjects').hidden = result.data.length === 0;
+}
+
+$('save-subject').addEventListener('click', async () => {
+  $('subject-error').textContent = '';
+  const result = await apiPost('/api/subjects/save', { store_dir: storeDir() }, {
+    name: $('subject-name').value.trim(),
+  });
+  if (!result.ok) { $('subject-error').textContent = result.error; return; }
+  $('subject-name').value = '';
+  loadSubjects();
+});
+
+$('issue-token-go').addEventListener('click', async () => {
+  $('issue-token-error').textContent = '';
+  if (!selectedSubject) return;
+  const roleNames = $('issue-token-roles').value.split(',').map((s) => s.trim()).filter(Boolean);
+  const result = await apiPost('/api/subjects/issue-token', { store_dir: storeDir() }, {
+    subject_id: selectedSubject.id,
+    role_names: roleNames,
+  });
+  if (!result.ok) { $('issue-token-error').textContent = result.error; return; }
+  $('issue-token-result').textContent = result.data.token;
+});
+
+async function loadPolicies() {
+  const result = await apiGet('/api/policies', { store_dir: storeDir() });
+  const body = $('admin-policies-body');
+  body.innerHTML = '';
+  if (!result.ok) { $('policy-error').textContent = result.error; return; }
+  $('policy-error').textContent = '';
+  for (const p of result.data) {
+    const tr = document.createElement('tr');
+    const actionsTd = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger small';
+    del.textContent = 'delete';
+    del.addEventListener('click', async () => {
+      const r = await apiPost('/api/policies/delete', { store_dir: storeDir() }, { id: p.id });
+      if (!r.ok) { $('policy-error').textContent = r.error; return; }
+      loadPolicies();
+    });
+    actionsTd.appendChild(del);
+    tr.innerHTML = `<td class="id">${shortId(p.id)}</td>`;
+    tr.appendChild(actionsTd);
+    body.appendChild(tr);
+  }
+  $('admin-policies').hidden = result.data.length === 0;
+}
+
+$('save-policy').addEventListener('click', async () => {
+  $('policy-error').textContent = '';
+  const redactFields = $('policy-redact').value.split(',').map((s) => s.trim()).filter(Boolean);
+  const result = await apiPost('/api/policies/save', { store_dir: storeDir() }, {
+    effect: $('policy-effect').value,
+    target_kind: $('policy-target-kind').value || null,
+    target_type: $('policy-target-type').value.trim() || null,
+    role_name: $('policy-role-name').value.trim() || null,
+    subject_id: $('policy-subject-id').value.trim() || null,
+    redact_fields: redactFields,
+  });
+  if (!result.ok) { $('policy-error').textContent = result.error; return; }
+  loadPolicies();
+});
+
+// ------------------------------------------------------------------
+
+restoreConnection();
+$('store_dir').addEventListener('change', saveConnection);
+$('token').addEventListener('change', saveConnection);
 $('status').textContent = 'connected to ' + window.location.host;
 </script>
 </body>

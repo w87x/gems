@@ -4,6 +4,7 @@
 
 pub mod base64url;
 pub mod crc32c;
+pub mod field_id;
 pub mod filelock;
 pub mod hmac;
 pub mod logging;
@@ -13,6 +14,7 @@ pub mod sha256;
 pub mod shutdown;
 pub mod tuid;
 
+pub use field_id::field_id;
 pub use tuid::Tuid;
 
 /// Errors shared across storage/index/codec layers. Frontend crates get

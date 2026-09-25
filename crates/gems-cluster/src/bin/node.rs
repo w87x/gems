@@ -7,7 +7,7 @@
 //! integration is separate, unbuilt work; a Raft node alone is everything
 //! a shard's consensus group needs).
 //!
-//! Two subcommands:
+//! Three subcommands:
 //!
 //! - `gems-cluster-node serve` — runs one Raft node forever (until
 //!   `SIGTERM`/`SIGINT`), configured entirely from environment variables
@@ -19,6 +19,11 @@
 //!   printing the assigned id/shard/log index. Exists so a deployment can
 //!   actually put data into the cluster to test with, without writing a
 //!   throwaway Rust program to call `ShardedClient` directly.
+//! - `gems-cluster-node install [--admin-name <name>]` — one-time cluster
+//!   bootstrap: seeds the starter roles/policies/admin subject
+//!   `gems_catalog::bootstrap` defines and prints an admin bearer token.
+//!   Run once, after the cluster's Raft nodes are up. See `run_install`'s
+//!   doc.
 //!
 //! Both subcommands read the same `GEMS_SHARD_MAP` JSON — the shape is
 //! deliberately array-of-objects, not a JSON object keyed by shard/node
@@ -52,6 +57,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::Duration;
 
+use gems_abac::SubjectContext;
 use gems_catalog::{EntityFlags, EntityHeader, EntityKind};
 use gems_cluster::raft::NodeId;
 use gems_cluster::raft_net::{self, RaftTiming};
@@ -68,8 +74,11 @@ fn main() {
     let result = match args.first().map(String::as_str) {
         Some("serve") => run_serve(),
         Some("propose") => run_propose(&args[1..]),
+        Some("install") => run_install(&args[1..]),
         _ => {
-            eprintln!("usage:\n  gems-cluster-node serve\n  gems-cluster-node propose --name <name> [--status <value>]");
+            eprintln!(
+                "usage:\n  gems-cluster-node serve\n  gems-cluster-node propose --name <name> [--status <value>]\n  gems-cluster-node install [--admin-name <name>]"
+            );
             std::process::exit(2);
         }
     };
@@ -286,6 +295,31 @@ fn run_serve() -> Result<(), String> {
 // `propose`
 // ---------------------------------------------------------------------
 
+/// Builds a `ShardedClient` from `$GEMS_SHARD_MAP`, resolving every shard's
+/// member client addresses — the setup shared by `propose` and `install`,
+/// the two subcommands that submit writes to an already-running cluster
+/// rather than running a Raft node themselves.
+fn build_sharded_client() -> Result<ShardedClient, String> {
+    let shard_map = parse_shard_map(&env_var("GEMS_SHARD_MAP")?)?;
+    let num_shards = shard_map.len() as u32;
+    if num_shards == 0 {
+        return Err("GEMS_SHARD_MAP has no shards".to_string());
+    }
+
+    let mut map = ShardMap::new();
+    for (&shard_id, members) in &shard_map {
+        for member in members {
+            let addr = resolve_with_retry(&member.client, Duration::from_secs(30))?;
+            map.add_member(shard_id, member.node, addr);
+        }
+    }
+    Ok(ShardedClient::new(
+        ShardRouter::new(num_shards),
+        map,
+        Duration::from_secs(5),
+    ))
+}
+
 fn run_propose(args: &[String]) -> Result<(), String> {
     let mut name = None;
     let mut status_field = None;
@@ -305,20 +339,7 @@ fn run_propose(args: &[String]) -> Result<(), String> {
     }
     let name = name.ok_or("propose: --name <name> is required")?;
 
-    let shard_map = parse_shard_map(&env_var("GEMS_SHARD_MAP")?)?;
-    let num_shards = shard_map.len() as u32;
-    if num_shards == 0 {
-        return Err("GEMS_SHARD_MAP has no shards".to_string());
-    }
-
-    let mut map = ShardMap::new();
-    for (&shard_id, members) in &shard_map {
-        for member in members {
-            let addr = resolve_with_retry(&member.client, Duration::from_secs(30))?;
-            map.add_member(shard_id, member.node, addr);
-        }
-    }
-    let client = ShardedClient::new(ShardRouter::new(num_shards), map, Duration::from_secs(5));
+    let client = build_sharded_client()?;
 
     let id = Tuid::generate();
     let shard = client.shard_of(&id);
@@ -363,6 +384,93 @@ fn run_propose(args: &[String]) -> Result<(), String> {
         LOG_TARGET,
         "note: the log index above is when the leader accepted the proposal, not proof of \
          replication to a majority yet — query the entity back to confirm it committed."
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// `install`
+// ---------------------------------------------------------------------
+
+/// One-time cluster bootstrap: seeds the `admin`/`analyst`/`consumer`
+/// `Role` entities, a starter policy set, and one admin `Subject` (see
+/// `gems_catalog::bootstrap`'s doc for exactly what that seeds and why),
+/// then issues that subject a never-expiring admin bearer token signed
+/// with `$GEMS_WEBUI_SECRET` — the same secret `gems-webui` verifies
+/// tokens against, so the printed token can be pasted straight into the
+/// webui's login screen. Run this once, after the cluster's Raft nodes are
+/// up (it proposes through the same `ShardedClient` path `propose` uses,
+/// so it needs a leader elected in every shard, not a store to write to
+/// directly — see `gems_catalog::bootstrap`'s doc for why installs never
+/// bypass the cluster's single-writer Raft log).
+fn run_install(args: &[String]) -> Result<(), String> {
+    let mut admin_name = "admin".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--admin-name" => {
+                admin_name = args
+                    .get(i + 1)
+                    .cloned()
+                    .ok_or("--admin-name needs a value")?;
+                i += 2;
+            }
+            other => return Err(format!("install: unknown argument {other:?}")),
+        }
+    }
+
+    let webui_secret = env_var("GEMS_WEBUI_SECRET")?;
+    if webui_secret.is_empty() {
+        return Err("$GEMS_WEBUI_SECRET must not be empty".to_string());
+    }
+    let client = build_sharded_client()?;
+    let seed = gems_catalog::bootstrap::bootstrap(&admin_name);
+
+    log_info!(
+        LOG_TARGET,
+        "proposing {} seed entities (roles, policies, admin subject)...",
+        seed.entities.len()
+    );
+    for entity in seed.entities {
+        let id = entity.header.id;
+        client
+            .propose(
+                &id,
+                LogRecord::Insert {
+                    header: entity.header,
+                    body: entity.body,
+                },
+            )
+            .map_err(|e| format!("install: failed to propose a seed entity: {e}"))?;
+    }
+
+    let token = gems_abac::token::issue(
+        webui_secret.as_bytes(),
+        &SubjectContext {
+            subject_id: seed.admin_subject_id,
+            roles: vec![seed.admin_role_id],
+        },
+        None,
+    );
+
+    println!(
+        "admin_subject_id:   {}",
+        seed.admin_subject_id.to_hex_string()
+    );
+    println!("admin_role_id:      {}", seed.admin_role_id.to_hex_string());
+    println!(
+        "analyst_role_id:    {}",
+        seed.analyst_role_id.to_hex_string()
+    );
+    println!(
+        "consumer_role_id:   {}",
+        seed.consumer_role_id.to_hex_string()
+    );
+    println!("admin_token:        {token}");
+    log_warn!(
+        LOG_TARGET,
+        "the printed token grants full admin access and never expires — store it like any \
+         other credential, not in shell history or a committed file."
     );
     Ok(())
 }

@@ -77,6 +77,17 @@ impl Value {
         }
     }
 
+    /// The full list of `(key, value)` pairs of an object, in the order
+    /// they were parsed/inserted. Unlike `get`, this lets a caller iterate
+    /// keys it doesn't know in advance — e.g. a form's arbitrary field
+    /// names — without needing them named up front.
+    pub fn entries(&self) -> Option<&[(String, Value)]> {
+        match self {
+            Value::Object(entries) => Some(entries),
+            _ => None,
+        }
+    }
+
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -152,6 +163,17 @@ mod tests {
         assert_eq!(v.get("a"), Some(&Value::Number(3.0)));
         assert_eq!(v.get("b"), Some(&Value::String("two".to_string())));
         assert_eq!(v.get("missing"), None);
+    }
+
+    #[test]
+    fn entries_iterates_an_objects_keys_in_insertion_order() {
+        let mut v = Value::object();
+        v.set("b", 2i64);
+        v.set("a", 1i64);
+        let entries = v.entries().unwrap();
+        assert_eq!(entries[0].0, "b");
+        assert_eq!(entries[1].0, "a");
+        assert!(Value::array().entries().is_none());
     }
 
     #[test]
