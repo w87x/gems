@@ -17,10 +17,15 @@
 # you specifically need to test that target from Apple Silicon.
 #
 # Usage:
-#   docker compose up --build            # start both shards (6 nodes)
+#   docker compose up --build            # start both shards (6 nodes) + webui
 #   docker compose logs -f shard0-node1  # watch one node's status/log lines
 #   docker compose run --rm client propose --name widget-1 --status active
 #   docker compose exec shard0-node1 gems query /data "SELECT * FROM entities"
+#   open http://localhost:8080           # browse data via the webui frontend
+#     - Store directory: /stores/shard0 (or /stores/shard1)
+#     - Access token: leave blank — the webui service runs with --insecure
+#       for local testing (see its service definition below); a real
+#       deployment should drop --insecure and set GEMS_WEBUI_SECRET instead
 #   docker compose down -v               # stop and wipe all store data
 
 x-shard-map: &shard-map |-
@@ -115,6 +120,21 @@ services:
     entrypoint: [gems-cluster-node]
     environment:
       GEMS_SHARD_MAP: *shard-map
+
+  # The browser query frontend (ARCHITECTURE.md §9). Reads each shard's
+  # data directly off its node-1 volume (read-only — this service never
+  # writes, so it never needs the store's directory lock). --insecure
+  # disables the Authorization: Bearer requirement, since this compose
+  # file is for local testing, not a real deployment.
+  webui:
+    build: .
+    entrypoint: [gems-webui]
+    command: ["--insecure", "0.0.0.0:8080"]
+    ports: ["8080:8080"]
+    volumes:
+      - shard0-node1-data:/stores/shard0:ro
+      - shard1-node1-data:/stores/shard1:ro
+    depends_on: [shard0-node1, shard1-node1]
 
 volumes:
   shard0-node1-data:
