@@ -1,30 +1,36 @@
-//! Stage 2 of ARCHITECTURE.md §6/§11's clustering plan: async log-shipping
-//! read replicas, deliberately *before* attempting full Raft. A
-//! `PrimaryStore` wraps `gems_engine::Store` and appends every mutation to
-//! a `ReplicationLog`; a `ReplicationServer` streams that log to any
-//! number of connecting `ReplicaClient`s over a plain TCP socket, each
-//! applying records to its own local `Store`.
+//! Clustering, per ARCHITECTURE.md §6/§11's staged plan:
 //!
-//! What this gives you: horizontal read scaling and a warm standby, cheap
-//! to build and reason about. What it explicitly does **not** give you:
-//! consensus, leader election, or split-brain protection — there is
-//! exactly one primary, chosen out of band (a human, a config file), and
-//! if it dies, promoting a replica to primary is a manual/operational
-//! step, not something this crate arbitrates. That gap is precisely what
-//! full Raft closes, and precisely why ARCHITECTURE.md recommends proving
-//! out this simpler stage first: the apply-record format
-//! (`LogRecord`/`ReplicationLog`) is the same shape a Raft log entry would
-//! need, so getting it right here isn't wasted work — it's what Raft would
-//! build on, not something Raft replaces.
+//! - **Stage 2 — async log-shipping read replicas** (`log`, `primary`,
+//!   `record`, `replica`, `server`): a `PrimaryStore` wraps
+//!   `gems_engine::Store` and appends every mutation to a
+//!   `ReplicationLog`; a `ReplicationServer` streams that log to any
+//!   number of connecting `ReplicaClient`s over a plain TCP socket, each
+//!   applying records to its own local `Store`. Gives you horizontal read
+//!   scaling and a warm standby, cheaply. Gives you **no** consensus,
+//!   leader election, or split-brain protection — exactly one primary,
+//!   chosen out of band, and promoting a replica after it dies is a
+//!   manual step this stage doesn't arbitrate.
+//! - **Stage 3 — full Raft** (`raft`): closes that gap. `RaftCore` is a
+//!   pure, I/O-free consensus state machine (see its module doc for why);
+//!   its committed log entries are `LogRecord`s, the exact type stage 2's
+//!   `ReplicaClient` already knows how to apply to a `Store` — the two
+//!   stages share the same apply-record format by design, per
+//!   ARCHITECTURE.md's note that getting stage 2's format right isn't
+//!   wasted work ahead of stage 3. Wiring `RaftCore` to real sockets and a
+//!   real timer (the "shell" its module doc describes) is the remaining
+//!   piece before this closes the loop into an actual replicated
+//!   `gems_engine::Store` end to end.
 
 mod log;
 mod primary;
+pub mod raft;
 mod record;
 mod replica;
 mod server;
 
 pub use log::ReplicationLog;
 pub use primary::PrimaryStore;
+pub use raft::{Envelope, LogEntry, RaftCore, RaftError, Role, Rpc};
 pub use record::LogRecord;
 pub use replica::ReplicaClient;
 pub use server::ReplicationServer;
