@@ -41,6 +41,7 @@ pub mod raft_net;
 mod record;
 mod replica;
 mod server;
+pub mod swim_net;
 
 pub use gossip::SwimCore;
 pub use log::ReplicationLog;

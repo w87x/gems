@@ -420,6 +420,270 @@ impl SwimCore {
     }
 }
 
+/// Wire encoding for `Envelope`/`SwimMessage`, used by `swim_net`'s real
+/// TCP shell. Same `u32`-length-prefixed framing as `raft::wire` and
+/// `record::LogRecord`, for the same reason: partial-buffer reads off a
+/// real socket compose the same way everywhere in this workspace.
+pub mod wire {
+    use super::{Envelope, GossipItem, Incarnation, NodeId, Status, SwimMessage};
+    use gems_common::{Error, Result};
+
+    const PING: u8 = 1;
+    const ACK: u8 = 2;
+
+    pub fn encode(envelope: &Envelope) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&envelope.from.to_le_bytes());
+        payload.extend_from_slice(&envelope.to.to_le_bytes());
+        match &envelope.message {
+            SwimMessage::Ping {
+                seq,
+                sender_incarnation,
+                gossip,
+            } => {
+                payload.push(PING);
+                encode_ping_or_ack_body(&mut payload, *seq, *sender_incarnation, gossip);
+            }
+            SwimMessage::Ack {
+                seq,
+                sender_incarnation,
+                gossip,
+            } => {
+                payload.push(ACK);
+                encode_ping_or_ack_body(&mut payload, *seq, *sender_incarnation, gossip);
+            }
+        }
+        let mut framed = Vec::with_capacity(4 + payload.len());
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        framed
+    }
+
+    fn encode_ping_or_ack_body(
+        out: &mut Vec<u8>,
+        seq: u32,
+        sender_incarnation: Incarnation,
+        gossip: &[GossipItem],
+    ) {
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&sender_incarnation.to_le_bytes());
+        out.extend_from_slice(&(gossip.len() as u32).to_le_bytes());
+        for item in gossip {
+            out.extend_from_slice(&item.member.to_le_bytes());
+            out.push(encode_status(item.status));
+            out.extend_from_slice(&item.incarnation.to_le_bytes());
+        }
+    }
+
+    fn encode_status(status: Status) -> u8 {
+        match status {
+            Status::Alive => 0,
+            Status::Suspect => 1,
+            Status::Dead => 2,
+        }
+    }
+
+    fn decode_status(b: u8) -> Result<Status> {
+        Ok(match b {
+            0 => Status::Alive,
+            1 => Status::Suspect,
+            2 => Status::Dead,
+            _ => {
+                return Err(Error::InvalidValue {
+                    detail: "unknown SWIM status byte",
+                })
+            }
+        })
+    }
+
+    /// Decode one envelope from the start of `buf`. `None` (not an error)
+    /// if `buf` doesn't yet hold a complete envelope.
+    pub fn decode(buf: &[u8]) -> Result<Option<(Envelope, usize)>> {
+        if buf.len() < 4 {
+            return Ok(None);
+        }
+        let payload_len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        let total_len = 4 + payload_len;
+        if buf.len() < total_len {
+            return Ok(None);
+        }
+        let payload = &buf[4..total_len];
+        let mut pos = 0;
+        let from = read_node_id(payload, &mut pos)?;
+        let to = read_node_id(payload, &mut pos)?;
+        let tag = read_u8(payload, &mut pos)?;
+
+        let (seq, sender_incarnation, gossip) = decode_ping_or_ack_body(payload, &mut pos)?;
+        let message = match tag {
+            PING => SwimMessage::Ping {
+                seq,
+                sender_incarnation,
+                gossip,
+            },
+            ACK => SwimMessage::Ack {
+                seq,
+                sender_incarnation,
+                gossip,
+            },
+            _ => {
+                return Err(Error::InvalidValue {
+                    detail: "unknown SWIM message tag",
+                })
+            }
+        };
+
+        Ok(Some((Envelope { from, to, message }, total_len)))
+    }
+
+    fn decode_ping_or_ack_body(
+        buf: &[u8],
+        pos: &mut usize,
+    ) -> Result<(u32, Incarnation, Vec<GossipItem>)> {
+        let seq = read_u32(buf, pos)?;
+        let sender_incarnation = read_u64(buf, pos)?;
+        let count = read_u32(buf, pos)? as usize;
+        let mut gossip = Vec::with_capacity(count);
+        for _ in 0..count {
+            let member = read_node_id(buf, pos)?;
+            let status = decode_status(read_u8(buf, pos)?)?;
+            let incarnation = read_u64(buf, pos)?;
+            gossip.push(GossipItem {
+                member,
+                status,
+                incarnation,
+            });
+        }
+        Ok((seq, sender_incarnation, gossip))
+    }
+
+    fn read_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
+        let b = *buf.get(*pos).ok_or(Error::InvalidValue {
+            detail: "SWIM envelope truncated",
+        })?;
+        *pos += 1;
+        Ok(b)
+    }
+
+    fn read_node_id(buf: &[u8], pos: &mut usize) -> Result<NodeId> {
+        read_u32(buf, pos)
+    }
+
+    fn read_u32(buf: &[u8], pos: &mut usize) -> Result<u32> {
+        if buf.len() < *pos + 4 {
+            return Err(Error::InvalidValue {
+                detail: "SWIM envelope truncated",
+            });
+        }
+        let v = u32::from_le_bytes(buf[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        Ok(v)
+    }
+
+    fn read_u64(buf: &[u8], pos: &mut usize) -> Result<u64> {
+        if buf.len() < *pos + 8 {
+            return Err(Error::InvalidValue {
+                detail: "SWIM envelope truncated",
+            });
+        }
+        let v = u64::from_le_bytes(buf[*pos..*pos + 8].try_into().unwrap());
+        *pos += 8;
+        Ok(v)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ping_roundtrip_with_gossip_items() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                message: SwimMessage::Ping {
+                    seq: 5,
+                    sender_incarnation: 3,
+                    gossip: vec![
+                        GossipItem {
+                            member: 4,
+                            status: Status::Suspect,
+                            incarnation: 2,
+                        },
+                        GossipItem {
+                            member: 5,
+                            status: Status::Dead,
+                            incarnation: 1,
+                        },
+                    ],
+                },
+            };
+            let encoded = encode(&env);
+            let (decoded, consumed) = decode(&encoded).unwrap().unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, env);
+        }
+
+        #[test]
+        fn ack_roundtrip_with_no_gossip() {
+            let env = Envelope {
+                from: 2,
+                to: 1,
+                message: SwimMessage::Ack {
+                    seq: 5,
+                    sender_incarnation: 0,
+                    gossip: vec![],
+                },
+            };
+            let encoded = encode(&env);
+            let (decoded, _) = decode(&encoded).unwrap().unwrap();
+            assert_eq!(decoded, env);
+        }
+
+        #[test]
+        fn decode_returns_none_on_partial_buffer() {
+            let env = Envelope {
+                from: 1,
+                to: 2,
+                message: SwimMessage::Ack {
+                    seq: 1,
+                    sender_incarnation: 0,
+                    gossip: vec![],
+                },
+            };
+            let encoded = encode(&env);
+            assert!(decode(&encoded[..encoded.len() - 1]).unwrap().is_none());
+        }
+
+        #[test]
+        fn decodes_two_back_to_back_envelopes() {
+            let a = Envelope {
+                from: 1,
+                to: 2,
+                message: SwimMessage::Ack {
+                    seq: 1,
+                    sender_incarnation: 0,
+                    gossip: vec![],
+                },
+            };
+            let b = Envelope {
+                from: 2,
+                to: 1,
+                message: SwimMessage::Ack {
+                    seq: 2,
+                    sender_incarnation: 0,
+                    gossip: vec![],
+                },
+            };
+            let mut buf = encode(&a);
+            buf.extend_from_slice(&encode(&b));
+            let (decoded_a, consumed_a) = decode(&buf).unwrap().unwrap();
+            let (decoded_b, consumed_b) = decode(&buf[consumed_a..]).unwrap().unwrap();
+            assert_eq!(decoded_a, a);
+            assert_eq!(decoded_b, b);
+            assert_eq!(consumed_a + consumed_b, buf.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
