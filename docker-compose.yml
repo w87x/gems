@@ -1,0 +1,125 @@
+# Two Raft shards (3 nodes each) + a one-shot client for proposing test
+# data, per OPERATIONS.md's cluster-bootstrap runbook (§5.2).
+#
+# Works unmodified on both Apple Silicon and Linux/Intel: every image
+# here is built from source via the `build:` context below, and Docker
+# resolves that build to the host's own architecture automatically — there
+# is nothing in this file or the Dockerfile that assumes a specific one.
+# The only case that's genuinely different between the two hosts is
+# deliberately testing the *other* architecture's image (e.g. validating
+# the Linux/amd64 build from an Apple Silicon laptop before it goes to a
+# Linux/Intel server) — for that, layer the override file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.linux-amd64.override.yml up
+#
+# which forces an emulated linux/amd64 build (slower — QEMU emulation, not
+# native) rather than the host's native architecture. Don't use it unless
+# you specifically need to test that target from Apple Silicon.
+#
+# Usage:
+#   docker compose up --build            # start both shards (6 nodes)
+#   docker compose logs -f shard0-node1  # watch one node's status/log lines
+#   docker compose run --rm client propose --name widget-1 --status active
+#   docker compose exec shard0-node1 gems query /data "SELECT * FROM entities"
+#   docker compose down -v               # stop and wipe all store data
+
+x-shard-map: &shard-map |-
+  {"shards":[
+    {"shard":0,"members":[
+      {"node":1,"peer":"shard0-node1:7000","client":"shard0-node1:7001"},
+      {"node":2,"peer":"shard0-node2:7000","client":"shard0-node2:7001"},
+      {"node":3,"peer":"shard0-node3:7000","client":"shard0-node3:7001"}
+    ]},
+    {"shard":1,"members":[
+      {"node":11,"peer":"shard1-node1:7000","client":"shard1-node1:7001"},
+      {"node":12,"peer":"shard1-node2:7000","client":"shard1-node2:7001"},
+      {"node":13,"peer":"shard1-node3:7000","client":"shard1-node3:7001"}
+    ]}
+  ]}
+
+# A throwaway default — replace with a real secret (e.g. `openssl rand
+# -base64 32`) for anything beyond local testing. See OPERATIONS.md §6.
+x-cluster-secret: &cluster-secret "local-testing-secret-change-me"
+
+x-node-defaults: &node-defaults
+  build: .
+  environment: &node-env
+    GEMS_SHARD_MAP: *shard-map
+    GEMS_CLUSTER_SECRET: *cluster-secret
+    GEMS_STORE_DIR: /data
+    GEMS_LOG: info
+    # Docker's bridge network has real (if small) latency compared to the
+    # loopback interface this project's own test suite runs Raft nodes
+    # over — these are still fast, just not as aggressive as those tests'
+    # localhost-only timings.
+    GEMS_TICK_MS: "200"
+    GEMS_HEARTBEAT_TICKS: "3"
+    GEMS_ELECTION_MIN_TICKS: "8"
+    GEMS_ELECTION_MAX_TICKS: "15"
+
+services:
+  shard0-node1:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "0"
+      GEMS_NODE_ID: "1"
+    volumes: [shard0-node1-data:/data]
+
+  shard0-node2:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "0"
+      GEMS_NODE_ID: "2"
+    volumes: [shard0-node2-data:/data]
+
+  shard0-node3:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "0"
+      GEMS_NODE_ID: "3"
+    volumes: [shard0-node3-data:/data]
+
+  shard1-node1:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "1"
+      GEMS_NODE_ID: "11"
+    volumes: [shard1-node1-data:/data]
+
+  shard1-node2:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "1"
+      GEMS_NODE_ID: "12"
+    volumes: [shard1-node2-data:/data]
+
+  shard1-node3:
+    <<: *node-defaults
+    environment:
+      <<: *node-env
+      GEMS_NODE_SHARD: "1"
+      GEMS_NODE_ID: "13"
+    volumes: [shard1-node3-data:/data]
+
+  # A one-shot proposer, not a long-running node — not started by `docker
+  # compose up`, only by `docker compose run --rm client propose ...`
+  # (the `tools` profile keeps it out of the default `up`/`start` set).
+  client:
+    build: .
+    profiles: [tools]
+    entrypoint: [gems-cluster-node]
+    environment:
+      GEMS_SHARD_MAP: *shard-map
+
+volumes:
+  shard0-node1-data:
+  shard0-node2-data:
+  shard0-node3-data:
+  shard1-node1-data:
+  shard1-node2-data:
+  shard1-node3-data:

@@ -57,8 +57,10 @@ name = "gems-cluster"
 version = "0.1.0"
 dependencies = [
  "gems-catalog",
+ "gems-codec",
  "gems-common",
  "gems-engine",
+ "gems-json",
  "rustix",
 ]
 
