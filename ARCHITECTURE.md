@@ -580,23 +580,43 @@ gets a shortcut around policy enforcement.
 - **CLI**: hand-rolled arg parsing (the surface area is small enough that a
   dependency isn't worth it) over the query engine; scriptable, prints
   the same SQL-like query language results as table/JSON/GBV-passthrough.
-- **TUI**: raw terminal control via `rustix`'s termios ioctls + a small
-  hand-rolled ANSI diffing renderer (double-buffer the screen, only emit
-  escape codes for cells that changed — this is the one piece worth being
-  disciplined about scope on, since a full `ratatui`-equivalent is a lot of
-  surface; keep the widget set to what the schema/query browsing UI
-  actually needs: tables, tree view for layers, a form editor for
-  entities).
-- **WebUI**: Svelte frontend (compiled to static JS/CSS, no build step at
-  server runtime), served by a small hand-rolled blocking HTTP/1.1 server
-  over `rustix` sockets — admin-tool traffic levels don't need an async
-  runtime. API surface is the query language + entity CRUD + policy admin,
-  all JSON (hand-rolled encoder/decoder, pairs naturally with GBV since
-  both are "typed value with a directory").
-- **MCP**: JSON-RPC over stdio (and optionally HTTP), exposing tools like
-  `query`, `get_entity`, `list_entity_types` — thin adapter over the same
-  engine, subject to the same ABAC PEP (an MCP client is just another
-  authenticated subject).
+- **TUI** (`gems-tui`, built): raw terminal control via `rustix`'s termios
+  ioctls (`tcgetattr`/`tcsetattr`/`make_raw` for raw mode, `tcgetwinsize`
+  for terminal size — all called with `std::io::stdin()`/`stdout()` as the
+  `AsFd` source rather than rustix's ownership-taking `take_stdin()`), plus
+  a hand-rolled ANSI renderer that diffs at line granularity (whole-line
+  string compare against the previous frame; only changed lines get an
+  escape-coded redraw — a deliberate coarser cut than full per-cell
+  diffing, adequate for a keyboard-driven browser where redraws only
+  happen on discrete key presses, not on any animation). Delivered as an
+  entity browser: list pane + detail pane, arrow keys or j/k to navigate,
+  `/` to enter a query (any `gems-query` SQL-subset string), q or Ctrl+C to
+  quit. The state machine (`app::App`) is factored out from all terminal
+  I/O and unit-tested directly — same "pure core + thin I/O shell" pattern
+  as `RaftCore`/`SwimCore`. Scope for this pass: read-only (no entity
+  create/edit — same "needs schema-driven form generation" reasoning as
+  the WebUI) and no ABAC subject context (administrative/raw access only,
+  same as the CLI's default).
+- **WebUI** (`gems-webui`, built): hand-rolled vanilla HTML/CSS/JS (no
+  build step, no framework) rather than the Svelte frontend originally
+  proposed here — deviation made explicit in `gems-webui/src/main.rs`'s
+  module doc: a Svelte build toolchain is real dependency surface for a
+  page this size (a two-panel query browser), and the gap in ergonomics
+  from hand-written DOM code doesn't show up yet at this UI's scale.
+  Served by a small hand-rolled blocking HTTP/1.1 server over `rustix`
+  sockets — admin-tool traffic levels don't need an async runtime. API
+  surface for this pass is read-only: `/api/types`, `/api/query`,
+  `/api/entity`, all `GET`, JSON responses (hand-rolled encoder/decoder),
+  ABAC opt-in via a `subject` query parameter. Entity CRUD/policy admin
+  through the WebUI is a later pass (needs the same schema-driven form
+  generation the TUI's create/edit scope cut defers).
+- **MCP** (`gems-mcp`, built): JSON-RPC 2.0 over stdio (newline-delimited,
+  no `Content-Length` framing), exposing `query`, `get_entity`,
+  `list_entity_types` — thin adapter over the same engine, subject to the
+  same ABAC PEP (an MCP client is just another authenticated subject, via
+  optional `subject`/`roles` tool arguments). Dispatch logic is split from
+  the stdio loop (`protocol.rs`/`tools.rs` vs. a thin `main.rs`) for the
+  same testability reason as the TUI's `app.rs` split.
 
 ## 10. Crate layout
 

@@ -12,4 +12,6 @@ path = "src/main.rs"
 rustix.workspace = true
 gems-common = { path = "../gems-common" }
 gems-catalog = { path = "../gems-catalog" }
+gems-codec = { path = "../gems-codec" }
 gems-engine = { path = "../gems-engine" }
+gems-query = { path = "../gems-query" }

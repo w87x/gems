@@ -24,4 +24,4 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-rustix = { version = "1", features = ["fs", "mm", "param", "rand"] }
+rustix = { version = "1", features = ["fs", "mm", "param", "rand", "termios"] }

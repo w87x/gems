@@ -141,8 +141,10 @@ name = "gems-tui"
 version = "0.1.0"
 dependencies = [
  "gems-catalog",
+ "gems-codec",
  "gems-common",
  "gems-engine",
+ "gems-query",
  "rustix",
 ]
 
