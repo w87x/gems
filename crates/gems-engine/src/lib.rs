@@ -18,9 +18,18 @@
 //!   files.
 //! - **Single primary index, single data file** (`file_id = 0`) — sharding
 //!   is cluster-layer work (ARCHITECTURE.md §6).
-//! - **No query planner.** `gems-query`'s AST isn't compiled against this
-//!   yet; `query_by_kind`/`query_by_schema_ref` are direct, hand-called
-//!   entry points proving the indexing behavior works end to end.
+//! - **A first, narrow query planner** (`Store::query`): compiles a
+//!   `gems_query::Query` against the indexes above, but only understands a
+//!   top-level `type IN (...)` filter (or no filter at all) — exactly
+//!   ARCHITECTURE.md §7's example's `type IN (xx, yy, zz)` clause, resolved
+//!   by a new name index over `EntityType`-kind entities so type names in
+//!   the query resolve to the TUIDs `query_by_schema_ref` needs. Compound
+//!   filters (`AND`/`OR` with `attr.*`/`layer.*` predicates), `ORDER BY`,
+//!   and non-type `IN`/comparison predicates all return an explicit
+//!   "unsupported" error rather than silently ignoring part of the query —
+//!   the rest of the planner (attribute lookups needing `EntityType`
+//!   resolution, layer membership, ABAC-filtered results) is real,
+//!   separate work, not something to fake here.
 
 mod ordinal;
 mod secondary;
@@ -30,6 +39,7 @@ use std::path::{Path, PathBuf};
 use gems_catalog::{EntityHeader, EntityKind};
 use gems_common::{Error, Result, Tuid};
 use gems_index::BTree;
+use gems_query::{Expr, Literal, Query};
 use gems_storage::{ExtentManager, SlotPointer};
 
 use ordinal::Ordinal;
@@ -55,6 +65,10 @@ pub struct Store {
     data: ExtentManager,
     by_kind: SecondaryIndex,
     by_schema_ref: SecondaryIndex,
+    /// Name -> ordinal, populated only for `EntityKind::EntityType`
+    /// entities — how the planner resolves a bare `type IN (widget, ...)`
+    /// name to the TUID `by_schema_ref` is keyed on.
+    entity_type_by_name: SecondaryIndex,
 }
 
 fn kind_key(kind: EntityKind) -> Vec<u8> {
@@ -63,6 +77,10 @@ fn kind_key(kind: EntityKind) -> Vec<u8> {
 
 fn schema_ref_key(schema_ref: &Tuid) -> Vec<u8> {
     schema_ref.as_bytes().to_vec()
+}
+
+fn name_key(name: &str) -> Vec<u8> {
+    name.as_bytes().to_vec()
 }
 
 impl Store {
@@ -82,6 +100,7 @@ impl Store {
             data,
             by_kind: SecondaryIndex::new(),
             by_schema_ref: SecondaryIndex::new(),
+            entity_type_by_name: SecondaryIndex::new(),
         })
     }
 
@@ -99,6 +118,7 @@ impl Store {
             data,
             by_kind: SecondaryIndex::new(),
             by_schema_ref: SecondaryIndex::new(),
+            entity_type_by_name: SecondaryIndex::new(),
         };
         store.rebuild_in_memory_indexes()?;
         Ok(store)
@@ -117,12 +137,29 @@ impl Store {
             };
             max_ordinal = Some(max_ordinal.map_or(ord, |m| m.max(ord)));
             let (header, _) = self.read_at(ptr)?;
-            self.by_kind.insert(kind_key(header.entity_kind), ord);
-            self.by_schema_ref
-                .insert(schema_ref_key(&header.schema_ref), ord);
+            self.index_header(&header, ord);
         }
         self.next_ordinal = max_ordinal.map_or(0, |m| m + 1);
         Ok(())
+    }
+
+    fn index_header(&mut self, header: &EntityHeader, ord: u32) {
+        self.by_kind.insert(kind_key(header.entity_kind), ord);
+        self.by_schema_ref
+            .insert(schema_ref_key(&header.schema_ref), ord);
+        if header.entity_kind == EntityKind::EntityType {
+            self.entity_type_by_name.insert(name_key(&header.name), ord);
+        }
+    }
+
+    fn deindex_header(&mut self, header: &EntityHeader, ord: u32) {
+        self.by_kind.remove(&kind_key(header.entity_kind), ord);
+        self.by_schema_ref
+            .remove(&schema_ref_key(&header.schema_ref), ord);
+        if header.entity_kind == EntityKind::EntityType {
+            self.entity_type_by_name
+                .remove(&name_key(&header.name), ord);
+        }
     }
 
     fn ordinal_for(&mut self, id: Tuid) -> Result<Ordinal> {
@@ -154,16 +191,11 @@ impl Store {
 
         if let Some(old_ptr) = self.primary.get(&header.id)? {
             let (old_header, _) = self.read_at(old_ptr)?;
-            self.by_kind
-                .remove(&kind_key(old_header.entity_kind), ord.0);
-            self.by_schema_ref
-                .remove(&schema_ref_key(&old_header.schema_ref), ord.0);
+            self.deindex_header(&old_header, ord.0);
             self.data.free(old_ptr)?;
         }
 
-        self.by_kind.insert(kind_key(header.entity_kind), ord.0);
-        self.by_schema_ref
-            .insert(schema_ref_key(&header.schema_ref), ord.0);
+        self.index_header(&header, ord.0);
 
         self.primary.insert(header.id, ptr)
     }
@@ -203,9 +235,7 @@ impl Store {
         let (header, _) = self.read_at(ptr)?;
         if let Some(ord) = self.ordinal_by_id.delete(id)? {
             self.id_by_ordinal.delete(&ord)?;
-            self.by_kind.remove(&kind_key(header.entity_kind), ord.0);
-            self.by_schema_ref
-                .remove(&schema_ref_key(&header.schema_ref), ord.0);
+            self.deindex_header(&header, ord.0);
         }
         self.data.free(ptr)?;
         Ok(true)
@@ -246,6 +276,73 @@ impl Store {
     /// behind ARCHITECTURE.md §7's `type IN (...)` example.
     pub fn query_by_schema_ref(&self, type_id: &Tuid) -> Result<Vec<Tuid>> {
         self.resolve_ordinals(self.by_schema_ref.get(&schema_ref_key(type_id)))
+    }
+
+    /// Resolve an `EntityType`'s name (as written unquoted in a query, e.g.
+    /// `type IN (widget, gadget)`) to its TUID. `None` if no `EntityType`
+    /// entity has that name.
+    pub fn find_entity_type_by_name(&self, name: &str) -> Result<Option<Tuid>> {
+        let ordinals = self.entity_type_by_name.get(&name_key(name));
+        let ids = self.resolve_ordinals(ordinals)?;
+        Ok(ids.into_iter().next())
+    }
+
+    /// Compile and execute a `gems_query::Query` against this store. See
+    /// the crate doc for exactly what's supported in this pass: no filter,
+    /// or a single top-level `type IN (...)`; `LIMIT` is applied to the
+    /// (Tuid-ordered) result, everything else is an explicit error rather
+    /// than a silently partial answer.
+    pub fn query(&self, query: &Query) -> Result<Vec<Tuid>> {
+        if !query.from.eq_ignore_ascii_case("entities") {
+            return Err(Error::InvalidValue {
+                detail: "the only queryable source is `entities`",
+            });
+        }
+        if !query.order_by.is_empty() {
+            return Err(Error::InvalidValue {
+                detail: "ORDER BY is not supported by this v1 planner",
+            });
+        }
+
+        let mut ids = match &query.filter {
+            None => self.scan_all()?.into_iter().map(|(h, _)| h.id).collect(),
+            Some(filter) => self.eval_type_in_filter(filter)?,
+        };
+
+        ids.sort();
+        if let Some(limit) = query.limit {
+            ids.truncate(limit as usize);
+        }
+        Ok(ids)
+    }
+
+    fn eval_type_in_filter(&self, expr: &Expr) -> Result<Vec<Tuid>> {
+        let Expr::In { field, values } = expr else {
+            return Err(Error::InvalidValue {
+                detail: "this v1 planner only supports a top-level `type IN (...)` filter",
+            });
+        };
+        if !field.eq_ignore_ascii_case("type") {
+            return Err(Error::InvalidValue {
+                detail: "this v1 planner only supports filtering on `type`",
+            });
+        }
+
+        let mut matched = gems_bitmap::RoaringBitmap::new();
+        for value in values {
+            let name = match value {
+                Literal::Ident(s) | Literal::Str(s) => s.as_str(),
+                _ => {
+                    return Err(Error::InvalidValue {
+                        detail: "type names in `type IN (...)` must be identifiers or strings",
+                    })
+                }
+            };
+            if let Some(type_id) = self.find_entity_type_by_name(name)? {
+                matched = matched.union(&self.by_schema_ref.get(&schema_ref_key(&type_id)));
+            }
+        }
+        self.resolve_ordinals(matched)
     }
 }
 
@@ -501,6 +598,83 @@ mod tests {
             expected.sort();
             assert_eq!(ids, expected);
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn query_parses_and_executes_type_in_end_to_end() {
+        let dir = tmp_dir("query_type_in");
+        let mut store = Store::create(&dir).unwrap();
+
+        // The EntityType entities that give "widget" and "gadget" meaning.
+        let widget_type = Tuid::new([20u8; 16], 20);
+        let gadget_type = Tuid::new([21u8; 16], 21);
+        let other_type = Tuid::new([22u8; 16], 22);
+        store
+            .insert(
+                sample_header(widget_type, "widget", EntityKind::EntityType, Tuid::NIL),
+                &[],
+            )
+            .unwrap();
+        store
+            .insert(
+                sample_header(gadget_type, "gadget", EntityKind::EntityType, Tuid::NIL),
+                &[],
+            )
+            .unwrap();
+        store
+            .insert(
+                sample_header(other_type, "other", EntityKind::EntityType, Tuid::NIL),
+                &[],
+            )
+            .unwrap();
+
+        let w1 = Tuid::new([30u8; 16], 30);
+        let g1 = Tuid::new([31u8; 16], 31);
+        let o1 = Tuid::new([32u8; 16], 32);
+        store
+            .insert(
+                sample_header(w1, "w1", EntityKind::Data, widget_type),
+                &gbv_body("active"),
+            )
+            .unwrap();
+        store
+            .insert(
+                sample_header(g1, "g1", EntityKind::Data, gadget_type),
+                &gbv_body("active"),
+            )
+            .unwrap();
+        store
+            .insert(
+                sample_header(o1, "o1", EntityKind::Data, other_type),
+                &gbv_body("active"),
+            )
+            .unwrap();
+
+        let query =
+            gems_query::parse("SELECT * FROM entities WHERE type IN (widget, gadget)").unwrap();
+        let mut result = store.query(&query).unwrap();
+        result.sort();
+        let mut expected = vec![w1, g1];
+        expected.sort();
+        assert_eq!(result, expected);
+
+        // A LIMIT clause truncates the (Tuid-ordered) result.
+        let limited =
+            gems_query::parse("SELECT * FROM entities WHERE type IN (widget, gadget) LIMIT 1")
+                .unwrap();
+        assert_eq!(store.query(&limited).unwrap().len(), 1);
+
+        // Unsupported constructs are an explicit error, not a silently
+        // partial answer.
+        let unsupported =
+            gems_query::parse("SELECT * FROM entities WHERE attr.status = 'active'").unwrap();
+        assert!(store.query(&unsupported).is_err());
+
+        let ordered =
+            gems_query::parse("SELECT * FROM entities ORDER BY modified_at DESC").unwrap();
+        assert!(store.query(&ordered).is_err());
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

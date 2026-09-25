@@ -53,6 +53,7 @@ dependencies = [
  "gems-codec",
  "gems-common",
  "gems-index",
+ "gems-query",
  "gems-storage",
 ]
 
