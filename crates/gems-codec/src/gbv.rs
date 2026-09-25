@@ -27,23 +27,24 @@ pub enum TypeTag {
     Bool = 2,
     Str = 3,
     Bin = 4,
-    Point2D = 5,   // 2x f64
-    Point3D = 6,   // 3x f64
-    Poly2D = 7,    // u32 count, then count x Point2D
-    Poly3D = 8,    // u32 count, then count x Point3D
-    Geo2D = 9,     // f64 lat, f64 lon
-    Geo3D = 10,    // f64 lat, f64 lon, f64 alt
-    Ipv4 = 11,     // 4 bytes
-    Ipv6 = 12,     // 16 bytes
-    Cidr4 = 13,    // 4 bytes network + u8 prefix_len
-    Cidr6 = 14,    // 16 bytes network + u8 prefix_len
-    Regex = 15,    // pattern string bytes
-    Currency = 16, // i64 minor units + u8 scale
-    DateTime = 17, // i64 ns since epoch
-    Duration = 18, // i64 ns
-    Uuid = 19,     // 16 bytes
-    EnumRef = 20,  // u32 VariantList entry index
-    Array = 21,    // u32 element_count, u8 element_tag, then packed elements
+    Point2D = 5,    // 2x f64
+    Point3D = 6,    // 3x f64
+    Poly2D = 7,     // u32 count, then count x Point2D
+    Poly3D = 8,     // u32 count, then count x Point3D
+    Geo2D = 9,      // f64 lat, f64 lon
+    Geo3D = 10,     // f64 lat, f64 lon, f64 alt
+    Ipv4 = 11,      // 4 bytes
+    Ipv6 = 12,      // 16 bytes
+    Cidr4 = 13,     // 4 bytes network + u8 prefix_len
+    Cidr6 = 14,     // 16 bytes network + u8 prefix_len
+    Regex = 15,     // pattern string bytes
+    Currency = 16,  // i64 minor units + u8 scale
+    DateTime = 17,  // i64 ns since epoch
+    Duration = 18,  // i64 ns
+    Uuid = 19,      // 16 bytes
+    EnumRef = 20,   // u32 VariantList entry index
+    Array = 21,     // u32 element_count, u8 element_tag, then packed elements
+    EntityRef = 22, // 24 bytes: another entity's Tuid
 }
 
 impl TypeTag {
@@ -72,6 +73,7 @@ impl TypeTag {
             19 => Uuid,
             20 => EnumRef,
             21 => Array,
+            22 => EntityRef,
             _ => {
                 return Err(Error::InvalidValue {
                     detail: "unknown GBV type tag",

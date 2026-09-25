@@ -6,3 +6,4 @@ license.workspace = true
 
 [dependencies]
 gems-common = { path = "../gems-common" }
+gems-codec = { path = "../gems-codec" }

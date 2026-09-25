@@ -26,6 +26,7 @@ version = "0.1.0"
 name = "gems-catalog"
 version = "0.1.0"
 dependencies = [
+ "gems-codec",
  "gems-common",
 ]
 
