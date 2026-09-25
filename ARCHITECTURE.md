@@ -427,6 +427,32 @@ cleanly onto this design:
   and a delete. What it deliberately does not have — consensus, leader
   election, split-brain protection, automatic failover — is stage (3)'s
   job, not a gap in stage (2).
+- **Stage (3), the Raft half, is implemented as a pure state machine**:
+  `gems-cluster::raft::RaftCore` (leader election, log replication, and the
+  §5.4.2 commit-index safety rule) takes explicit `tick()`/`receive()`
+  inputs and returns the messages to send, with no sockets, timers, or
+  threads inside it — what makes the tricky interleavings (a stale leader
+  rejoining, a partitioned minority, a candidate with a stale log)
+  deterministically testable, driving several instances from one test
+  thread over a simulated, fully test-controlled network. Its committed
+  entries are `LogRecord`s, the same type stage (2)'s `ReplicaClient`
+  already applies to a `Store` — the two stages share the apply-record
+  format by design. Wiring `RaftCore` to real sockets and a real timer (the
+  network "shell") is the remaining piece before this closes the loop into
+  an actual replicated `Store` end to end; log compaction, cluster
+  membership changes, and connecting to `gems-engine` are each separate
+  follow-on work, not implemented here.
+- **The gossip/SWIM half is also implemented**, as `gems-cluster::gossip::
+  SwimCore` — same pure-state-machine shape, for the same testability
+  reason. Covers membership and failure detection (Alive/Suspect/Dead per
+  member, incarnation-numbered so only a member's own refutation can clear
+  a suspicion about it, piggybacked on ping/ack rather than a separate
+  gossip round) but not yet indirect probing (SWIM's "ping-req" — asking
+  other members to double-check a suspect before giving up on it, which
+  reduces false positives from an asymmetric network problem between one
+  pair of nodes) or disseminating the shard map specifically — the
+  membership layer is there, what a shard map disseminated over it would
+  look like is unbuilt.
 
 ## 7. Query language
 

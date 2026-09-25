@@ -20,7 +20,20 @@
 //!   real timer (the "shell" its module doc describes) is the remaining
 //!   piece before this closes the loop into an actual replicated
 //!   `gems_engine::Store` end to end.
+//! - **Cluster membership and failure detection** (`gossip`): the other
+//!   half of §6 — "gossip (SWIM-style) for cluster membership, failure
+//!   detection, and disseminating the shard map." `SwimCore` is the same
+//!   pure-state-machine shape as `RaftCore`, for the same testability
+//!   reason; see its module doc for what's simplified relative to full
+//!   SWIM (no indirect probing, round-robin rather than randomized ping
+//!   order) and why those are reasonable cuts for a trusted-cluster
+//!   context rather than gaps to paper over. This is deliberately
+//!   independent of the Raft module — real deployments would use gossip
+//!   to disseminate *which nodes exist and are reachable*, separately
+//!   from Raft's job of getting a specific shard's replicas to agree on
+//!   its log.
 
+pub mod gossip;
 mod log;
 mod primary;
 pub mod raft;
@@ -28,9 +41,10 @@ mod record;
 mod replica;
 mod server;
 
+pub use gossip::SwimCore;
 pub use log::ReplicationLog;
 pub use primary::PrimaryStore;
-pub use raft::{Envelope, LogEntry, RaftCore, RaftError, Role, Rpc};
+pub use raft::{RaftCore, RaftError};
 pub use record::LogRecord;
 pub use replica::ReplicaClient;
 pub use server::ReplicationServer;
