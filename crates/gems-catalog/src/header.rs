@@ -41,6 +41,28 @@ pub struct EntityHeader {
 }
 
 impl EntityHeader {
+    /// Convenience constructor for callers that don't yet have a real
+    /// `created_by`/`modified_by` subject to attribute the write to — the
+    /// same "generate a placeholder id" every hand-written header builder
+    /// in this workspace (`gems-cli`, `gems-cluster-node`) already did
+    /// ad hoc, now shared in one place.
+    pub fn new(id: Tuid, name: &str, kind: EntityKind, schema_ref: Tuid) -> Self {
+        let placeholder = Tuid::generate().uuid();
+        EntityHeader {
+            id,
+            created_by: placeholder,
+            modified_by: placeholder,
+            modified_at_ns: id.created_at_ns() as i64,
+            name: name.to_string(),
+            description: String::new(),
+            flags: EntityFlags::NONE,
+            entity_kind: kind,
+            schema_ref,
+            body_offset: 0,
+            body_len: 0,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(ENCODED_LEN);
         out.extend_from_slice(&MAGIC.to_le_bytes());

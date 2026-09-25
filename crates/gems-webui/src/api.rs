@@ -27,7 +27,7 @@ use crate::http::Request;
 
 pub type ApiResult = Result<Value, (u16, String)>;
 
-fn open_store(req: &Request) -> Result<Store, (u16, String)> {
+pub(crate) fn open_store(req: &Request) -> Result<Store, (u16, String)> {
     let dir = req
         .query_param("store_dir")
         .ok_or((400, "store_dir is required".to_string()))?;
@@ -38,7 +38,10 @@ fn open_store(req: &Request) -> Result<Store, (u16, String)> {
 /// enforce reads under. `Ok(None)` only ever happens in `Insecure` mode —
 /// under `Enforced`, a missing/invalid/expired token is always an `Err`
 /// (401), never a silent fall-through to raw access.
-fn authorize(req: &Request, auth: &AuthMode) -> Result<Option<SubjectContext>, (u16, String)> {
+pub(crate) fn authorize(
+    req: &Request,
+    auth: &AuthMode,
+) -> Result<Option<SubjectContext>, (u16, String)> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -47,7 +50,7 @@ fn authorize(req: &Request, auth: &AuthMode) -> Result<Option<SubjectContext>, (
         .map_err(|e| (401, e.to_string()))
 }
 
-fn entity_summary(header: &EntityHeader) -> Value {
+pub(crate) fn entity_summary(header: &EntityHeader) -> Value {
     let mut v = Value::object();
     v.set("id", header.id.to_hex_string());
     v.set("name", header.name.clone());
@@ -231,6 +234,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            body: Vec::new(),
         }
     }
 

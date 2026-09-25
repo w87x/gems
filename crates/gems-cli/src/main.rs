@@ -28,7 +28,7 @@ use gems_catalog::{
     SubjectPredicate, TargetPredicate,
 };
 use gems_codec::{GbvBuilder, GbvReader, TypeTag};
-use gems_common::Tuid;
+use gems_common::{field_id, Tuid};
 use gems_engine::Store;
 
 fn main() -> ExitCode {
@@ -427,19 +427,6 @@ fn new_header(id: Tuid, name: &str, kind: EntityKind, schema_ref: Tuid) -> Entit
         body_offset: 0,
         body_len: 0,
     }
-}
-
-/// FNV-1a, folding a field name into the u32 attribute id used as a GBV
-/// key. A real schema-driven write path assigns these from
-/// `EntityAttribute` definitions instead; this is a CLI-only placeholder
-/// for typing simple `key=value` pairs by hand.
-fn field_id(name: &str) -> u32 {
-    let mut hash: u32 = 0x811c9dc5;
-    for b in name.as_bytes() {
-        hash ^= *b as u32;
-        hash = hash.wrapping_mul(0x01000193);
-    }
-    hash
 }
 
 #[cfg(test)]
