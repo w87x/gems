@@ -3,8 +3,12 @@
 //! compatible `Auxiliary` types, with an explicit exclusion list for
 //! combinations that don't make sense together.
 
-use gems_common::tuid::TUID_LEN;
 use gems_common::{Error, Result, Tuid};
+
+use crate::util::{
+    read_optional_bytes, read_tuid, read_tuid_list, read_u16, read_u8, write_optional_bytes,
+    write_tuid_list,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntityTypeKind {
@@ -49,13 +53,7 @@ impl EntityType {
         for a in &self.attributes {
             out.extend_from_slice(a.attribute_id.as_bytes());
             out.push(a.required as u8);
-            match &a.default {
-                Some(bytes) => {
-                    out.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
-                    out.extend_from_slice(bytes);
-                }
-                None => out.extend_from_slice(&0u16.to_le_bytes()),
-            }
+            write_optional_bytes(&mut out, &a.default);
         }
 
         write_tuid_list(&mut out, &self.compatible_with);
@@ -80,12 +78,7 @@ impl EntityType {
         for _ in 0..attr_count {
             let attribute_id = read_tuid(buf, &mut pos)?;
             let required = read_u8(buf, &mut pos)? != 0;
-            let default_len = read_u16(buf, &mut pos)? as usize;
-            let default = if default_len == 0 {
-                None
-            } else {
-                Some(read_bytes(buf, &mut pos, default_len)?.to_vec())
-            };
+            let default = read_optional_bytes(buf, &mut pos)?;
             attributes.push(AttributeRef {
                 attribute_id,
                 required,
@@ -103,51 +96,6 @@ impl EntityType {
             incompatible_with,
         })
     }
-}
-
-fn write_tuid_list(out: &mut Vec<u8>, list: &[Tuid]) {
-    out.extend_from_slice(&(list.len() as u16).to_le_bytes());
-    for t in list {
-        out.extend_from_slice(t.as_bytes());
-    }
-}
-
-fn read_tuid_list(buf: &[u8], pos: &mut usize) -> Result<Vec<Tuid>> {
-    let count = read_u16(buf, pos)? as usize;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        out.push(read_tuid(buf, pos)?);
-    }
-    Ok(out)
-}
-
-fn read_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
-    let b = *buf.get(*pos).ok_or(Error::InvalidValue {
-        detail: "EntityType buffer truncated",
-    })?;
-    *pos += 1;
-    Ok(b)
-}
-
-fn read_u16(buf: &[u8], pos: &mut usize) -> Result<u16> {
-    let bytes = read_bytes(buf, pos, 2)?;
-    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_tuid(buf: &[u8], pos: &mut usize) -> Result<Tuid> {
-    let bytes = read_bytes(buf, pos, TUID_LEN)?;
-    Ok(Tuid::from_bytes(bytes.try_into().unwrap()))
-}
-
-fn read_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
-    if buf.len() < *pos + len {
-        return Err(Error::InvalidValue {
-            detail: "EntityType buffer truncated",
-        });
-    }
-    let slice = &buf[*pos..*pos + len];
-    *pos += len;
-    Ok(slice)
 }
 
 #[cfg(test)]
