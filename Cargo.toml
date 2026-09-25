@@ -8,6 +8,7 @@ members = [
     "crates/gems-index",
     "crates/gems-bitmap",
     "crates/gems-query",
+    "crates/gems-engine",
 ]
 
 [workspace.package]

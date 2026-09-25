@@ -45,6 +45,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-engine"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-codec",
+ "gems-common",
+ "gems-index",
+ "gems-storage",
+]
+
+[[package]]
 name = "gems-index"
 version = "0.1.0"
 dependencies = [
