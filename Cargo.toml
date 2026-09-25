@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gems-common",
+    "crates/gems-storage",
+    "crates/gems-codec",
+    "crates/gems-catalog",
+    "crates/gems-index",
+    "crates/gems-bitmap",
+    "crates/gems-query",
+    "crates/gems-engine",
+    "crates/gems-abac",
+    "crates/gems-cli",
+    "crates/gems-cluster",
+    "crates/gems-subscribe",
+    "crates/gems-json",
+    "crates/gems-tui",
+    "crates/gems-webui",
+    "crates/gems-mcp",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+rustix = { version = "1", features = ["fs", "mm", "param", "process", "rand", "termios"] }

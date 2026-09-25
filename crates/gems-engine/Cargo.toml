@@ -1,0 +1,15 @@
+[package]
+name = "gems-engine"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gems-common = { path = "../gems-common" }
+gems-storage = { path = "../gems-storage" }
+gems-index = { path = "../gems-index" }
+gems-catalog = { path = "../gems-catalog" }
+gems-codec = { path = "../gems-codec" }
+gems-bitmap = { path = "../gems-bitmap" }
+gems-query = { path = "../gems-query" }
+gems-abac = { path = "../gems-abac" }

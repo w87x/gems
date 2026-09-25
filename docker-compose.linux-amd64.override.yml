@@ -1,0 +1,25 @@
+# Forces an emulated linux/amd64 build on any host (e.g. testing the
+# Linux/Intel target from an Apple Silicon laptop via QEMU) instead of
+# the native architecture docker-compose.yml resolves to by default.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.linux-amd64.override.yml up
+#
+# Slower than a native build/run (QEMU emulation) — only use this when you
+# specifically need to validate the amd64 target before it goes to a
+# Linux/Intel server.
+
+services:
+  shard0-node1:
+    platform: linux/amd64
+  shard0-node2:
+    platform: linux/amd64
+  shard0-node3:
+    platform: linux/amd64
+  shard1-node1:
+    platform: linux/amd64
+  shard1-node2:
+    platform: linux/amd64
+  shard1-node3:
+    platform: linux/amd64
+  client:
+    platform: linux/amd64
