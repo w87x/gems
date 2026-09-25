@@ -12,3 +12,4 @@ gems-catalog = { path = "../gems-catalog" }
 gems-codec = { path = "../gems-codec" }
 gems-bitmap = { path = "../gems-bitmap" }
 gems-query = { path = "../gems-query" }
+gems-abac = { path = "../gems-abac" }

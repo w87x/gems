@@ -43,6 +43,7 @@ dependencies = [
 name = "gems-cli"
 version = "0.1.0"
 dependencies = [
+ "gems-abac",
  "gems-catalog",
  "gems-codec",
  "gems-common",
@@ -68,6 +69,7 @@ dependencies = [
 name = "gems-engine"
 version = "0.1.0"
 dependencies = [
+ "gems-abac",
  "gems-bitmap",
  "gems-catalog",
  "gems-codec",

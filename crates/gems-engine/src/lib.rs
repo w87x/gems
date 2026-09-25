@@ -28,8 +28,16 @@
 //!   and non-type `IN`/comparison predicates all return an explicit
 //!   "unsupported" error rather than silently ignoring part of the query —
 //!   the rest of the planner (attribute lookups needing `EntityType`
-//!   resolution, layer membership, ABAC-filtered results) is real,
-//!   separate work, not something to fake here.
+//!   resolution, layer membership) is real, separate work, not something
+//!   to fake here.
+//! - **ABAC is wired in as an opt-in enforced path** (`get_enforced`/
+//!   `query_enforced`, using `gems-abac`'s PDP/PEP over `load_policies`),
+//!   not as the only way to read. `get`/`query` stay unenforced — this
+//!   crate doesn't force every caller through a subject context (an
+//!   internal migration job, a CLI running as an administrator, or a
+//!   replication stream all legitimately need raw access), so ABAC is
+//!   something a caller opts into per read, not a mode the whole store is
+//!   switched into.
 
 mod ordinal;
 mod secondary;
@@ -343,6 +351,63 @@ impl Store {
             }
         }
         self.resolve_ordinals(matched)
+    }
+
+    /// Every `Policy` entity currently stored, decoded. Policies are
+    /// ordinary entities (ARCHITECTURE.md §8), so this is just
+    /// `query_by_kind(Policy)` plus a decode of each body — no separate
+    /// policy store to keep in sync.
+    pub fn load_policies(&self) -> Result<Vec<gems_catalog::Policy>> {
+        self.query_by_kind(EntityKind::Policy)?
+            .into_iter()
+            .map(|id| {
+                let (_, body) = self.get(&id)?.ok_or(Error::CorruptPage {
+                    detail: "policy id from secondary index missing from storage",
+                })?;
+                gems_catalog::Policy::decode(&body)
+            })
+            .collect()
+    }
+
+    /// `get`, filtered/redacted through the ABAC PEP (`gems_abac::enforce`)
+    /// for `subject`. `None` both when the entity doesn't exist and when it
+    /// exists but no policy permits `subject` to see it — the two are
+    /// indistinguishable by design (ARCHITECTURE.md §8's PEP never reveals
+    /// *that* a denied entity exists, only that the result has nothing for
+    /// this id).
+    pub fn get_enforced(
+        &self,
+        id: &Tuid,
+        subject: &gems_abac::SubjectContext,
+    ) -> Result<Option<(EntityHeader, Vec<u8>)>> {
+        let Some(pair) = self.get(id)? else {
+            return Ok(None);
+        };
+        let policies = self.load_policies()?;
+        Ok(gems_abac::enforce(&policies, subject, [pair])
+            .into_iter()
+            .next())
+    }
+
+    /// `query`, filtered/redacted through the ABAC PEP for `subject`. This
+    /// is the "query result can be partial and some fields or whole
+    /// objects won't show" behavior from ARCHITECTURE.md §8: candidates
+    /// come from the same planner as `query`, then each one is decided and
+    /// possibly redacted before being returned.
+    pub fn query_enforced(
+        &self,
+        query: &Query,
+        subject: &gems_abac::SubjectContext,
+    ) -> Result<Vec<(EntityHeader, Vec<u8>)>> {
+        let ids = self.query(query)?;
+        let policies = self.load_policies()?;
+        let mut entities = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(pair) = self.get(&id)? {
+                entities.push(pair);
+            }
+        }
+        Ok(gems_abac::enforce(&policies, subject, entities))
     }
 }
 
@@ -674,6 +739,123 @@ mod tests {
         let ordered =
             gems_query::parse("SELECT * FROM entities ORDER BY modified_at DESC").unwrap();
         assert!(store.query(&ordered).is_err());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn insert_policy(store: &mut Store, policy: &gems_catalog::Policy, name: &str) -> Tuid {
+        let id = Tuid::generate();
+        store
+            .insert(
+                sample_header(id, name, EntityKind::Policy, Tuid::NIL),
+                &policy.encode(),
+            )
+            .unwrap();
+        id
+    }
+
+    #[test]
+    fn no_policies_means_enforced_reads_see_nothing() {
+        let dir = tmp_dir("abac_default_deny");
+        let mut store = Store::create(&dir).unwrap();
+        let type_id = Tuid::new([9u8; 16], 1);
+        let id = Tuid::new([1u8; 16], 1);
+        store
+            .insert(
+                sample_header(id, "w1", EntityKind::Data, type_id),
+                &gbv_body("active"),
+            )
+            .unwrap();
+
+        let anonymous = gems_abac::SubjectContext {
+            subject_id: Tuid::NIL,
+            roles: vec![],
+        };
+        assert!(store.get_enforced(&id, &anonymous).unwrap().is_none());
+
+        let query = gems_query::parse("SELECT * FROM entities").unwrap();
+        assert!(store.query_enforced(&query, &anonymous).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_permit_policy_makes_enforced_reads_visible() {
+        let dir = tmp_dir("abac_permit");
+        let mut store = Store::create(&dir).unwrap();
+        let type_id = Tuid::new([9u8; 16], 1);
+        let id = Tuid::new([1u8; 16], 1);
+        store
+            .insert(
+                sample_header(id, "w1", EntityKind::Data, type_id),
+                &gbv_body("active"),
+            )
+            .unwrap();
+
+        insert_policy(
+            &mut store,
+            &gems_catalog::Policy {
+                target: gems_catalog::TargetPredicate::ANY,
+                subject: gems_catalog::SubjectPredicate::ANY,
+                effect: gems_catalog::Effect::Permit,
+                redact_attributes: vec![],
+            },
+            "allow-all",
+        );
+
+        let anonymous = gems_abac::SubjectContext {
+            subject_id: Tuid::NIL,
+            roles: vec![],
+        };
+        let (header, _) = store.get_enforced(&id, &anonymous).unwrap().unwrap();
+        assert_eq!(header.id, id);
+
+        let query = gems_query::parse("SELECT * FROM entities").unwrap();
+        let results = store.query_enforced(&query, &anonymous).unwrap();
+        // The permit-all policy is itself a Policy-kind entity with no
+        // matching target restriction, so it's visible too.
+        assert!(results.iter().any(|(h, _)| h.id == id));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn query_enforced_redacts_fields_per_permit_obligation() {
+        let dir = tmp_dir("abac_redact");
+        let mut store = Store::create(&dir).unwrap();
+        let type_id = Tuid::new([9u8; 16], 1);
+        let id = Tuid::new([1u8; 16], 1);
+
+        let mut body = GbvBuilder::new();
+        body.push(1, TypeTag::Str, b"public-value");
+        body.push(2, TypeTag::Str, b"secret-value");
+        let body = body.finish();
+        store
+            .insert(sample_header(id, "w1", EntityKind::Data, type_id), &body)
+            .unwrap();
+
+        insert_policy(
+            &mut store,
+            &gems_catalog::Policy {
+                target: gems_catalog::TargetPredicate {
+                    entity_kind: Some(EntityKind::Data),
+                    schema_ref: type_id,
+                },
+                subject: gems_catalog::SubjectPredicate::ANY,
+                effect: gems_catalog::Effect::Permit,
+                redact_attributes: vec![2],
+            },
+            "redact-field-2",
+        );
+
+        let anonymous = gems_abac::SubjectContext {
+            subject_id: Tuid::NIL,
+            roles: vec![],
+        };
+        let (_, redacted_body) = store.get_enforced(&id, &anonymous).unwrap().unwrap();
+        let reader = GbvReader::new(&redacted_body).unwrap();
+        assert_eq!(reader.get(1).unwrap().1, b"public-value");
+        assert!(reader.get(2).is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
