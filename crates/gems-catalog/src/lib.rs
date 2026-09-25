@@ -18,7 +18,7 @@ pub mod subject;
 mod util;
 
 pub use entity_attribute::EntityAttribute;
-pub use entity_type::EntityType;
+pub use entity_type::{AttributeRef, EntityType, EntityTypeKind};
 pub use flags::EntityFlags;
 pub use header::EntityHeader;
 pub use kind::EntityKind;

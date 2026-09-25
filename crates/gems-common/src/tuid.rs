@@ -44,6 +44,40 @@ impl Tuid {
     }
 
     pub const NIL: Tuid = Tuid([0u8; TUID_LEN]);
+
+    /// Generate a fresh `Tuid`: `crate::rand::random_bytes` for the UUID
+    /// half, the current wall-clock time for the timestamp half. This is
+    /// the constructor real callers (the CLI, or anything else minting new
+    /// entity ids) use; `new` stays available for tests and anywhere a
+    /// caller supplies its own bytes deterministically.
+    pub fn generate() -> Self {
+        let uuid_bytes = crate::rand::random_bytes();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        Tuid::new(uuid_bytes, now_ns)
+    }
+
+    /// Parse the hex form printed by `to_hex_string` (48 lowercase or
+    /// uppercase hex characters, no separators).
+    pub fn from_hex_str(s: &str) -> Option<Self> {
+        if s.len() != TUID_LEN * 2 {
+            return None;
+        }
+        let mut bytes = [0u8; TUID_LEN];
+        for i in 0..TUID_LEN {
+            bytes[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+        }
+        Some(Tuid(bytes))
+    }
+
+    /// A plain 48-character hex encoding of the full 24 bytes — used for
+    /// CLI/API input and output where `Debug`'s UUID-with-`@timestamp`
+    /// formatting isn't what a caller wants to type or parse back.
+    pub fn to_hex_string(&self) -> String {
+        self.0.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 impl fmt::Debug for Tuid {
@@ -75,5 +109,25 @@ mod tests {
         let a = Tuid::new([0u8; 16], 1);
         let b = Tuid::new([0u8; 16], 2);
         assert!(a < b);
+    }
+
+    #[test]
+    fn generate_produces_distinct_ids() {
+        let a = Tuid::generate();
+        let b = Tuid::generate();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn hex_string_roundtrip() {
+        let t = Tuid::new([0xab; 16], 0x0123456789abcdef);
+        let hex = t.to_hex_string();
+        assert_eq!(hex.len(), 48);
+        assert_eq!(Tuid::from_hex_str(&hex), Some(t));
+    }
+
+    #[test]
+    fn hex_parse_rejects_wrong_length() {
+        assert_eq!(Tuid::from_hex_str("ab"), None);
     }
 }

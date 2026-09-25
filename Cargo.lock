@@ -40,6 +40,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gems-cli"
+version = "0.1.0"
+dependencies = [
+ "gems-catalog",
+ "gems-codec",
+ "gems-common",
+ "gems-engine",
+ "gems-query",
+]
+
+[[package]]
 name = "gems-codec"
 version = "0.1.0"
 dependencies = [

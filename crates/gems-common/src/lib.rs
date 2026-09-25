@@ -4,6 +4,7 @@
 
 pub mod crc32c;
 pub mod pagesize;
+pub mod rand;
 pub mod tuid;
 
 pub use tuid::Tuid;

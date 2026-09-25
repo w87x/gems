@@ -1,0 +1,16 @@
+[package]
+name = "gems-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gems"
+path = "src/main.rs"
+
+[dependencies]
+gems-common = { path = "../gems-common" }
+gems-catalog = { path = "../gems-catalog" }
+gems-codec = { path = "../gems-codec" }
+gems-engine = { path = "../gems-engine" }
+gems-query = { path = "../gems-query" }
