@@ -28,8 +28,21 @@ pub struct FileLock {
 /// file description already holds it — including one held by a different
 /// process, which is the scenario this exists to catch.
 pub fn acquire_exclusive(path: &Path) -> Result<FileLock> {
-    let fd = fs::open(path, OFlags::CREATE | OFlags::RDWR, Mode::RUSR | Mode::WUSR)
-        .map_err(std::io::Error::from)?;
+    // `CLOEXEC` matters here specifically because this fd holds a `flock`:
+    // without it, any child process this one later spawns (via
+    // `std::process::Command`, which is a plain `fork`+`exec` on Unix)
+    // inherits the fd across the `exec`, and since `flock` is scoped to
+    // the open file description rather than the process, that inherited
+    // copy keeps the lock held for as long as the *child* lives — long
+    // after this process drops its own `FileLock` — causing unrelated,
+    // spurious `AlreadyLocked` failures for anyone else trying to open the
+    // same store while that unrelated child happens to still be running.
+    let fd = fs::open(
+        path,
+        OFlags::CREATE | OFlags::RDWR | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )
+    .map_err(std::io::Error::from)?;
     fs::flock(&fd, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::AlreadyLocked {
         path: path.to_path_buf(),
     })?;
@@ -78,6 +91,40 @@ mod tests {
             let _first = acquire_exclusive(&path).unwrap();
         }
         assert!(acquire_exclusive(&path).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_spawned_child_process_does_not_inherit_the_lock_fd() {
+        // Without O_CLOEXEC on the lock's fd, a child process spawned
+        // while the lock is held (any std::process::Command — a plain
+        // fork+exec on Unix) would inherit a live duplicate of it, and
+        // since flock is scoped to the open file description rather than
+        // the process, that inherited copy would keep the lock held for
+        // as long as the *child* runs — well past this process dropping
+        // its own handle. A real crash-recovery test in gems-cluster
+        // (which spawns a real subprocess) hit exactly this: a concurrent,
+        // unrelated test's lock re-acquisition spuriously failed because
+        // the subprocess had inherited its fd.
+        let dir = tmp_dir("cloexec");
+        let path = dir.join("lock");
+        let lock = acquire_exclusive(&path).unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("2")
+            .spawn()
+            .expect("failed to spawn a child process for this test");
+
+        drop(lock);
+        let reacquired = acquire_exclusive(&path);
+        assert!(
+            reacquired.is_ok(),
+            "the lock must be released as soon as its owner drops it, even with an \
+             unrelated child process still running"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
         std::fs::remove_dir_all(&dir).ok();
     }
 

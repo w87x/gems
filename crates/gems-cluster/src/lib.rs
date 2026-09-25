@@ -39,6 +39,7 @@ mod log;
 mod primary;
 pub mod raft;
 pub mod raft_net;
+pub mod raft_state;
 mod record;
 mod replica;
 mod server;

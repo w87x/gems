@@ -466,6 +466,41 @@ cleanly onto this design:
   replicate a proposal into separate `gems_engine::Store` instances (Raft),
   and three actual nodes converge on membership and detect an unreachable
   one (SWIM) — both stable across repeated runs.
+- **A node's persistent Raft state now survives a crash**: `gems-cluster::
+  raft_state` durably persists `current_term`/`voted_for`/`log[]` — the
+  three fields the Raft paper (§5.1) requires be on stable storage before
+  a node acts on them — and `raft_net::spawn` restores them on startup via
+  `RaftCore::restore`. Before this, `RaftCore`'s persistent state lived
+  only in the in-memory `Vec<LogEntry>`/fields its own module doc already
+  flagged as the network shell's responsibility to persist — a real gap,
+  not just a documented scope cut: a restarted node forgetting its term or
+  vote can vote twice in the same term, the exact safety violation Raft's
+  voting rule exists to prevent. Written as a full-snapshot
+  write-temp-file/fsync/atomic-rename (plus an fsync of the containing
+  directory, since POSIX doesn't guarantee a rename's durability without
+  one) rather than an incremental log, persisted after every `receive()`/
+  successful `propose()` and after any `tick()` that actually changed
+  term/role/vote — before, not after, that iteration's outgoing RPCs are
+  sent, per the paper's ordering requirement. Volatile state
+  (`commit_index`/`last_applied`) is deliberately *not* persisted — Raft
+  recovers it through normal protocol operation, and re-applying an
+  already-applied `LogRecord` to a `Store` is safe by construction
+  (insert overwrites; delete-of-already-deleted is a no-op).
+  **Verified with an actual `SIGKILL`**, not just a unit test of the
+  encode/decode format: a real single-node cluster process proposes
+  several entries, then gets a hard `kill -9` (via `rustix::process::
+  kill_process`) with no chance to run any shutdown/cleanup code: the
+  persisted term/log survive intact, exactly as if a real deployed node's
+  host had lost power. That same investigation also surfaced a second,
+  related bug this fixed: `gems_common::filelock`'s lock file wasn't
+  opened `O_CLOEXEC`, so a process that spawned a child while holding a
+  store's lock leaked a live duplicate of that lock into the child via
+  `fork`+`exec` — the lock stayed effectively held for as long as the
+  *child* ran, well past the original owner dropping it, causing spurious
+  `AlreadyLocked` failures for anyone else. Both bugs were found by the
+  same crash-recovery test, not by inspection — concrete evidence for why
+  this kind of test belongs in the suite rather than being satisfied by
+  reasoning about the code.
 - **Peer traffic is authenticated**: every `raft::wire`/`gossip::wire`
   frame carries an HMAC-SHA256 tag over its payload, keyed by a secret
   shared across the cluster (`raft_net::spawn`/`swim_net::spawn` both take

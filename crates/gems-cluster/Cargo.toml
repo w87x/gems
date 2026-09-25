@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rustix.workspace = true
 gems-common = { path = "../gems-common" }
 gems-catalog = { path = "../gems-catalog" }
 gems-engine = { path = "../gems-engine" }

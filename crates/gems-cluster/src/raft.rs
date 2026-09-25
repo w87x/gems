@@ -154,6 +154,35 @@ impl RaftCore {
         }
     }
 
+    /// Builds a `RaftCore` restored from previously persisted state — a
+    /// node restarting after a crash or clean shutdown must not forget
+    /// which term it's in, who (if anyone) it already voted for this
+    /// term, or any log entry a leader may already be counting toward a
+    /// majority (see this module's doc: persisting these three fields
+    /// durably before acting on them is the network shell's job, not
+    /// this pure core's — `crate::raft_state` is that piece). Volatile
+    /// state (`commit_index`, `last_applied`) is *not* restored — that's
+    /// correct per the Raft paper: it's recovered through normal protocol
+    /// operation (a leader's `leader_commit` field, or this node's own
+    /// single-node fast path), and re-applying an already-applied
+    /// `LogRecord` to a `Store` is safe (insert overwrites; delete of an
+    /// already-deleted entity is a no-op).
+    pub fn restore(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        election_timeout: u32,
+        heartbeat_interval: u32,
+        current_term: Term,
+        voted_for: Option<NodeId>,
+        log: Vec<LogEntry>,
+    ) -> Self {
+        let mut core = Self::new(id, peers, election_timeout, heartbeat_interval);
+        core.current_term = current_term;
+        core.voted_for = voted_for;
+        core.log = log;
+        core
+    }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -164,6 +193,15 @@ impl RaftCore {
 
     pub fn current_term(&self) -> Term {
         self.current_term
+    }
+
+    pub fn voted_for(&self) -> Option<NodeId> {
+        self.voted_for
+    }
+
+    /// The full persisted-state triple, for the shell to write to disk.
+    pub fn persistent_state(&self) -> (Term, Option<NodeId>, &[LogEntry]) {
+        (self.current_term, self.voted_for, &self.log)
     }
 
     pub fn log_len(&self) -> u64 {

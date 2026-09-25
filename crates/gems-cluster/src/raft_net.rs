@@ -170,11 +170,33 @@ pub fn spawn(
     let span = hi.saturating_sub(lo).max(1);
     let jittered = lo + (u32::from_le_bytes(gems_common::rand::random_bytes()) % span);
 
+    // Restore whatever term/vote/log this node persisted before its last
+    // crash or shutdown — see `raft_state`'s module doc for why forgetting
+    // this on restart would be a real Raft safety violation, not just data
+    // loss.
+    let (term, voted_for, log) = crate::raft_state::load(store_dir)?;
     let peer_ids: Vec<NodeId> = peers.keys().copied().collect();
-    let core = RaftCore::new(id, peer_ids, jittered, heartbeat_interval_ticks);
+    let core = RaftCore::restore(
+        id,
+        peer_ids,
+        jittered,
+        heartbeat_interval_ticks,
+        term,
+        voted_for,
+        log,
+    );
 
+    let state_dir = store_dir.to_path_buf();
     let join = thread::spawn(move || {
-        run_engine(core, store, peers, from_network, tick_interval, secret);
+        run_engine(
+            core,
+            store,
+            peers,
+            from_network,
+            tick_interval,
+            secret,
+            state_dir,
+        );
     });
 
     Ok(RaftNodeHandle {
@@ -287,6 +309,21 @@ fn apply_to_store(store: &mut Store, command: &LogRecord) {
     let _ = result;
 }
 
+/// Persists `core`'s current term/vote/log to `state_dir`, per the Raft
+/// paper's requirement that this happen before acting on the state change
+/// (here: before this loop iteration's outgoing RPCs are sent). A failure
+/// here is treated as fatal (panics, taking the node down) rather than
+/// logged and ignored: continuing to run as a Raft node whose vote or log
+/// entry silently failed to reach durable storage risks exactly the
+/// safety violation this whole module exists to prevent, and a crashed
+/// node is something the rest of the cluster already tolerates by design,
+/// unlike a node that's up but lying about its own history.
+fn persist_state(core: &RaftCore, state_dir: &std::path::Path) {
+    let (term, voted_for, log) = core.persistent_state();
+    crate::raft_state::save(state_dir, term, voted_for, log)
+        .expect("failed to persist Raft state durably");
+}
+
 fn run_engine(
     mut core: RaftCore,
     mut store: Store,
@@ -294,16 +331,24 @@ fn run_engine(
     inbound: Receiver<EngineMsg>,
     tick_interval: Duration,
     secret: Arc<Vec<u8>>,
+    state_dir: std::path::PathBuf,
 ) {
     loop {
         let outgoing = match inbound.recv_timeout(tick_interval) {
-            Ok(EngineMsg::Inbound(envelope)) => core.receive(envelope),
+            Ok(EngineMsg::Inbound(envelope)) => {
+                let outgoing = core.receive(envelope);
+                persist_state(&core, &state_dir);
+                outgoing
+            }
             Ok(EngineMsg::Propose(command, respond)) => {
                 let result = core.propose(command);
                 let outgoing = match &result {
                     Ok((_, msgs)) => msgs.clone(),
                     Err(_) => Vec::new(),
                 };
+                if result.is_ok() {
+                    persist_state(&core, &state_dir);
+                }
                 let _ = respond.send(result.map(|(index, _)| index));
                 outgoing
             }
@@ -312,7 +357,19 @@ fn run_engine(
                 Vec::new()
             }
             Ok(EngineMsg::Shutdown) => return,
-            Err(mpsc::RecvTimeoutError::Timeout) => core.tick(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // `tick()` never touches the log, only term/role/vote (on
+                // an election timeout firing), so comparing just those is
+                // a safe, cheap way to skip a redundant fsync on the
+                // common case (a heartbeat tick that changes nothing).
+                let before = (core.current_term(), core.role(), core.voted_for());
+                let outgoing = core.tick();
+                let after = (core.current_term(), core.role(), core.voted_for());
+                if before != after {
+                    persist_state(&core, &state_dir);
+                }
+                outgoing
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         };
 
@@ -382,6 +439,142 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         None
+    }
+
+    /// Env var naming the store directory: its presence is how this test
+    /// tells its own re-exec'd child process "you're the crash-simulating
+    /// helper, not the launcher" (see the test below).
+    const CRASH_HELPER_ENV: &str = "GEMS_RAFT_CRASH_HELPER_DIR";
+
+    #[test]
+    fn a_hard_killed_node_recovers_its_persisted_term_and_log_on_restart() {
+        if let Ok(dir) = std::env::var(CRASH_HELPER_ENV) {
+            run_crash_helper(std::path::PathBuf::from(dir));
+        }
+
+        let dir = tmp_dir("crash_recovery");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let test_name =
+            "raft_net::tests::a_hard_killed_node_recovers_its_persisted_term_and_log_on_restart";
+
+        // Re-exec this same test binary, filtered to just this test, with
+        // the helper env var set — the recursive call above takes the
+        // helper branch instead of getting here again.
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", test_name, "--nocapture"])
+            .env(CRASH_HELPER_ENV, &dir)
+            .spawn()
+            .expect("failed to spawn the crash-test helper subprocess");
+
+        // Poll the on-disk state (not the process, which we have no IPC
+        // into) until the helper has persisted the entries it proposes
+        // right after becoming leader.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok((_, _, log)) = crate::raft_state::load(&dir) {
+                if log.len() >= 3 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper process never persisted the proposed entries in time"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (term_before_kill, _, log_before_kill) = crate::raft_state::load(&dir).unwrap();
+
+        // SIGKILL: no clean shutdown, no Drop code, no chance to flush
+        // anything — exactly what a hard `kill -9` (or a host power loss)
+        // does to a real deployed process. If durability here depended on
+        // graceful-shutdown code ever running, this is where that would
+        // show up as lost or corrupted state.
+        let pid = rustix::process::Pid::from_raw(child.id() as i32)
+            .expect("child pid should be a valid nonzero pid");
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL)
+            .expect("failed to SIGKILL the helper process");
+        let status = child
+            .wait()
+            .expect("failed to reap the killed helper process");
+        assert!(
+            !status.success(),
+            "the helper must have been killed, not exited on its own"
+        );
+
+        // What was already durable before the kill must still be exactly
+        // what it was — the crash must not have corrupted or rolled back
+        // anything already fsync'd.
+        let (term_after, _voted_for, log_after) = crate::raft_state::load(&dir).unwrap();
+        assert!(term_after >= term_before_kill);
+        assert!(log_after.len() >= log_before_kill.len());
+        assert_eq!(log_after[..log_before_kill.len()], log_before_kill[..]);
+
+        // The actual point of this test: a fresh RaftCore restored from
+        // this on-disk state — exactly what `spawn()` does whenever a
+        // node restarts — sees the term this node had reached and the
+        // entries it had logged, not a reset-to-zero state. Forgetting
+        // either after a restart is a real Raft safety violation (a node
+        // that forgets its term/vote can vote twice in the same term),
+        // not just data loss.
+        assert!(
+            term_after >= 1,
+            "term must have advanced past the initial single-node election"
+        );
+        assert_eq!(
+            log_after.len(),
+            3,
+            "all three proposed entries must have survived the crash"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The crash-simulating helper: runs as a re-exec'd child process (see
+    /// above). Starts a single-node Raft "cluster" (no peers, so it
+    /// becomes its own leader immediately), proposes a few entries so
+    /// there's real persisted state to check, then parks forever —
+    /// deliberately never calling `shutdown()` or running any cleanup —
+    /// until the parent test sends it SIGKILL.
+    fn run_crash_helper(dir: std::path::PathBuf) -> ! {
+        let peer_port = free_port();
+        let client_port = free_port();
+        let handle = spawn(
+            1,
+            &format!("127.0.0.1:{peer_port}"),
+            &format!("127.0.0.1:{client_port}"),
+            HashMap::new(),
+            &dir,
+            RaftTiming {
+                tick_interval: Duration::from_millis(20),
+                heartbeat_interval_ticks: 3,
+                election_timeout_ticks_range: (6, 10),
+            },
+            test_secret(),
+        )
+        .expect("crash-test helper failed to start its Raft node");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(handle.status(), Ok((Role::Leader, _))) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "crash-test helper's single-node cluster never became leader"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        for i in 0..3u8 {
+            handle
+                .propose(LogRecord::Insert {
+                    header: header(Tuid::new([i; 16], i as u64)),
+                    body: b"x".to_vec(),
+                })
+                .expect("crash-test helper failed to propose an entry");
+        }
+
+        loop {
+            thread::sleep(Duration::from_secs(3600));
+        }
     }
 
     #[test]

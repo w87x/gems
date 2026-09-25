@@ -59,6 +59,7 @@ dependencies = [
  "gems-catalog",
  "gems-common",
  "gems-engine",
+ "rustix",
 ]
 
 [[package]]
