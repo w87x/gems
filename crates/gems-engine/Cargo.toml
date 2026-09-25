@@ -10,3 +10,4 @@ gems-storage = { path = "../gems-storage" }
 gems-index = { path = "../gems-index" }
 gems-catalog = { path = "../gems-catalog" }
 gems-codec = { path = "../gems-codec" }
+gems-bitmap = { path = "../gems-bitmap" }

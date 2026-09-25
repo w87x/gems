@@ -48,6 +48,7 @@ dependencies = [
 name = "gems-engine"
 version = "0.1.0"
 dependencies = [
+ "gems-bitmap",
  "gems-catalog",
  "gems-codec",
  "gems-common",
