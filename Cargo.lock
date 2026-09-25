@@ -150,7 +150,9 @@ dependencies = [
 name = "gems-webui"
 version = "0.1.0"
 dependencies = [
+ "gems-abac",
  "gems-catalog",
+ "gems-codec",
  "gems-common",
  "gems-engine",
  "gems-json",

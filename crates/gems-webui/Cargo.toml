@@ -14,3 +14,5 @@ gems-catalog = { path = "../gems-catalog" }
 gems-engine = { path = "../gems-engine" }
 gems-query = { path = "../gems-query" }
 gems-json = { path = "../gems-json" }
+gems-abac = { path = "../gems-abac" }
+gems-codec = { path = "../gems-codec" }
