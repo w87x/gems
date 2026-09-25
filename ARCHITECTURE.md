@@ -7,6 +7,10 @@ this repo and the rationale behind each choice. Where "avoid 3rd-party"
 collides with something you really don't want to hand-roll (crypto), that
 tradeoff is called out explicitly.
 
+See `OPERATIONS.md` for how to actually deploy, secure, and run this
+system day to day — this document is about how it's built, not how to
+operate it.
+
 ## 0. Guiding constraints
 
 - **No dependency graph.** We link `rustix` (thin syscall wrapper, no libc
@@ -17,13 +21,32 @@ tradeoff is called out explicitly.
   comment crediting the origin and license. This keeps the supply chain to
   "us + rustix" and lets us tune every format to our on-disk layout instead
   of fighting someone else's serialization model.
-- **One exception worth taking on purpose: cryptography.** Password hashing
-  (Argon2id) and TOTP (HMAC-SHA1/256) are the one place where "just
-  reimplement it" is a real security risk (timing side channels, subtle spec
-  bugs). Vendor a small, well-known reference implementation (e.g. the
-  RustCrypto `sha2`/`hmac`/`argon2` crates' source, pulled in as vendored
-  files, not as a Cargo dependency) rather than writing your own from the
-  spec. Everything else in this design is fair game to hand-roll.
+- **One exception worth taking on purpose: cryptography.** "Just
+  reimplement it" is a real security risk here (timing side channels,
+  subtle spec bugs) in a way it isn't for the rest of this design. The
+  original plan for this section was to vendor a small, well-known
+  reference implementation (e.g. RustCrypto's `sha2`/`hmac`/`argon2`
+  source, pulled in as vendored files, not as a Cargo dependency) rather
+  than write one from the spec. **What actually got built (the
+  production-hardening pass's access-token/peer-authentication work)
+  instead hand-rolled SHA-256 and HMAC-SHA256 from their specs**
+  (`gems-common::sha256`/`hmac`), verified against real NIST/RFC
+  known-answer test vectors rather than vendored from a reference
+  implementation — a real deviation from this section's own advice, made
+  under that pass's time constraints, not a considered reversal of it.
+  The mitigating factor: this system has no password storage (no
+  Argon2id was ever needed — there's no "steal the hash, crack it
+  offline" scenario to worry about), and the one place a timing
+  side-channel would actually matter — comparing an HMAC tag or JWT
+  signature against an attacker-supplied value — does go through a
+  dedicated `constant_time_eq`, not `==`. The hash/HMAC *computation*
+  itself, though, is plain, not hardened against cache-timing attacks
+  the way a vetted implementation would be. Acceptable for this
+  project's current threat model (a trusted-operator cluster and an
+  access-token scheme, not a public-multi-tenant secret store), but
+  swapping in a vendored reference implementation is real, worthwhile
+  follow-on work before this handles anything higher-stakes — not
+  something to keep re-deciding to defer indefinitely.
 - **Linux + macOS/ARM.** Page size is *not* a constant (4 KiB on Linux
   x86_64, 16 KiB on Apple Silicon). Query it at runtime via
   `rustix::param::page_size()`. Decouple the *logical* B-tree page size
